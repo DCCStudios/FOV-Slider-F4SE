@@ -1418,9 +1418,13 @@ namespace FOVSlider
 	void FOVManager::NotifyFPInertiaLock(bool locked)
 	{
 		auto* msg = F4SE::GetMessagingInterface();
-		if (!msg) return;
+		if (!msg) {
+			logger::warn("[FOVSlider] FSLK dispatch failed: MessagingInterface unavailable (locked={})", locked);
+			return;
+		}
 		std::uint8_t payload = locked ? 1u : 0u;
-		msg->Dispatch(kFPInertia_LockMsg, &payload, sizeof(payload), "FPInertia");
+		const bool ok = msg->Dispatch(kFPInertia_LockMsg, &payload, sizeof(payload), "FPInertia");
+		logger::info("[FOVSlider] FSLK dispatch -> FPInertia: locked={} ok={}", locked, ok);
 	}
 
 	void FOVManager::ScheduleFPInertiaUnlock(int ms)
