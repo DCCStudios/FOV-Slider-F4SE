@@ -529,15 +529,32 @@ namespace FOVSlider
 		//    every frame). Without this the INI write is INVISIBLE until
 		//    something forces the engine to copy INI -> runtime - which
 		//    is what was making our smooth lerps look like snaps.
-		WriteRuntimeCameraFOV(fov, std::numeric_limits<float>::quiet_NaN(),
-			"ApplyFirstPersonFOV");
+		//
+		// Caveat: during ADS the engine drives its own zoom via
+		// PlayerCamera::fovAdjustCurrent/Target/PerSec on top of
+		// firstPersonFOV. The aim-FOV feature relies on the engine
+		// re-reading our INI write into the runtime lerp; if we ALSO
+		// write runtime ourselves, we race the engine's adjust system
+		// and ADS becomes choppy. So skip the runtime write while
+		// context == Aiming - the AimLerp's INI writes still drive
+		// the engine's own lerp like they used to.
+		if (context.load() != FOVContext::Aiming) {
+			WriteRuntimeCameraFOV(fov, std::numeric_limits<float>::quiet_NaN(),
+				"ApplyFirstPersonFOV");
+		}
 	}
 
 	void FOVManager::ApplyThirdPersonFOV(float fov)
 	{
 		SetEngineFloatSetting("fDefaultWorldFOV:Display", fov, "ApplyThirdPersonFOV");
-		WriteRuntimeCameraFOV(std::numeric_limits<float>::quiet_NaN(), fov,
-			"ApplyThirdPersonFOV");
+		// Same reasoning as ApplyFirstPersonFOV - skip the runtime
+		// write while aiming. 3rd-person FOV isn't visible during
+		// iron sights anyway, and avoiding the write keeps us out
+		// of the engine's ADS path entirely.
+		if (context.load() != FOVContext::Aiming) {
+			WriteRuntimeCameraFOV(std::numeric_limits<float>::quiet_NaN(), fov,
+				"ApplyThirdPersonFOV");
+		}
 	}
 
 	void FOVManager::ApplyThirdPersonAimFOV(float fov)
@@ -590,10 +607,17 @@ namespace FOVSlider
 			//
 			// Re-assert the saved 3rd-person FOV here so a 1st->3rd
 			// camera transition doesn't briefly show the viewmodel
-			// value. Also re-assert 1st-person to defend against any
-			// secondary engine writes that race the console command.
+			// value. The 1st-person re-assert is gated on Aiming
+			// because the engine's fovAdjust system owns runtime
+			// firstPersonFOV during ADS and our write would race it.
+			// 3rd-person FOV isn't ADS-related, so we always restore
+			// it (worst case: harmless write while in iron-sights).
 			const float savedThird = Settings::GetSingleton()->thirdPersonFOV.load();
-			WriteRuntimeCameraFOV(camFov, savedThird, "ApplyViewmodelFOV/post-fov");
+			const bool writeFirst = context.load() != FOVContext::Aiming;
+			WriteRuntimeCameraFOV(
+				writeFirst ? camFov : std::numeric_limits<float>::quiet_NaN(),
+				savedThird,
+				writeFirst ? "ApplyViewmodelFOV/post-fov" : "ApplyViewmodelFOV/post-fov(aim)");
 		}
 	}
 
