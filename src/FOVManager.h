@@ -40,19 +40,35 @@ namespace FOVSlider
 		// Smoothly lerp the engine's camera FOV settings from their
 		// current values to the saved targets over `durationMs` ms,
 		// stepping every `stepMs` ms (default 8 = ~1 frame at 120 fps).
-		// Used both by the game-load burst and by the drift watcher's
-		// auto-correct, so any post-load FOV restore by the engine is
-		// pulled back smoothly instead of snapping.
 		//
 		// Settings that don't visibly transition (3rd-person aim FOV,
 		// near distance) are applied instantly at the start.
 		// Settings that DO transition (1st-person FOV, 3rd-person
-		// world FOV) are lerped per-step.
-		// Viewmodel FOV is applied via `fov X Y` ONCE at the end so
-		// we don't recompile the console script every 8 ms.
+		// world FOV) are lerped per-step (writes both INI and runtime).
+		//
+		// `a_includeViewmodel` controls the final stage:
+		//   - true  (Phase 1 game-load, manual "Smooth Re-apply"):
+		//       Issues `fov X Y` viewmodel apply at the end and
+		//       dispatches FSRF to FPInertia so its WBFOV defaults
+		//       refresh.
+		//   - false (Phase 2 game-load retries, anywhere we just want
+		//       to make sure the camera/INI is at target):
+		//       Skips both. Avoids re-triggering FPInertia's WBFOV
+		//       apply, which clobbers `PlayerCamera::firstPersonFOV`
+		//       via the engine's `fov X Y` quirk (X overwrites BOTH
+		//       camera fields regardless of Y) and would otherwise
+		//       create a 30 deg flash + 250 ms drift-correct ramp on
+		//       every Phase 2 retry.
+		//
+		// NOTE: pure-runtime drift correction does NOT call this
+		// function at all - use SmoothCorrectRuntimeFOV() for that
+		// path. This function still writes INI and is fine for any
+		// caller that legitimately wants the engine source-of-truth
+		// pulled to target.
+		//
 		// Cancels any in-flight lerp via the interpGeneration counter.
 		// Spawns a detached worker thread; returns immediately.
-		void LerpAllSettings(int durationMs, int stepMs = 8);
+		void LerpAllSettings(int durationMs, int stepMs = 8, bool a_includeViewmodel = true);
 
 		// Schedule a deferred re-apply of all settings to defeat the
 		// engine's late camera initialization on game load. Spawns a
@@ -184,6 +200,19 @@ namespace FOVSlider
 		// returns false if PlayerCamera is null.
 		static bool ReadRuntimeCameraFOV(float& a_firstPersonFOV,
 		                                 float& a_worldFOV);
+
+		// Smoothly corrects PlayerCamera::firstPersonFOV/worldFOV to
+		// the saved targets without touching INI, viewmodel, or
+		// FPInertia. Used by the drift watcher when something else
+		// (FPInertia's `fov X Y` re-apply, an engine restore on load,
+		// etc.) clobbered the runtime camera fields. We can't go
+		// through the full apply chain because issuing our own
+		// `fov X Y` here would re-trigger FPInertia's WBFOV apply and
+		// create the feedback loop the user reported as "constant
+		// fov lerping and popping". Cancels in-flight lerps via
+		// interpGeneration. Spawns a detached thread; returns
+		// immediately.
+		void SmoothCorrectRuntimeFOV(int durationMs, int stepMs = 8);
 
 		// Background thread spawned on Init() (when iDriftWatchIntervalMs
 		// > 0). Polls the engine's `fDefault1stPersonFOV:Display` and

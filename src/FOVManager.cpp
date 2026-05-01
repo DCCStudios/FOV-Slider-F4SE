@@ -188,6 +188,87 @@ namespace FOVSlider
 		return true;
 	}
 
+	// ============================================================
+	// Runtime-only camera FOV lerp
+	// ============================================================
+	//
+	// Used by the drift watcher when something else clobbered
+	// PlayerCamera::firstPersonFOV / worldFOV (typically FPInertia's
+	// `fov X Y` for per-weapon WBFOV - the engine quirk sets BOTH
+	// camera fields to X regardless of Y, and FPInertia has no
+	// runtime undo). We need to pull the camera back to the saved
+	// target smoothly, but going through ApplyFirstPersonFOV /
+	// ApplyThirdPersonFOV (which write INI too) and especially
+	// LerpAllSettings (which finishes with ApplyViewmodelFOV +
+	// NotifyFPInertia) creates a feedback loop:
+	//   our `fov X Y` clobbers runtime -> our undo fixes -> FSRF ->
+	//   FPInertia re-applies WBFOV -> runtime clobbered again ->
+	//   watcher detects -> repeat forever.
+	//
+	// This function ONLY writes PlayerCamera runtime fields. It does
+	// not touch INI (FPInertia already fixed those after its
+	// `fov X Y`), it does not touch viewmodel (FPInertia owns that
+	// per weapon), and it does not dispatch FSRF (which would
+	// re-trigger the loop).
+	void FOVManager::SmoothCorrectRuntimeFOV(int durationMs, int stepMs)
+	{
+		const std::uint64_t myGen = ++interpGeneration;
+
+		std::thread([this, myGen, durationMs, stepMs]() {
+			auto* s = Settings::GetSingleton();
+
+			activeLerps.fetch_add(1);
+			LogEngineSnapshot("RuntimeCorrect/start");
+
+			float startFirst = std::numeric_limits<float>::quiet_NaN();
+			float startThird = std::numeric_limits<float>::quiet_NaN();
+			(void)ReadRuntimeCameraFOV(startFirst, startThird);
+
+			// If the runtime is unreadable, fall back to instant write
+			// (we still want to push the saved value into the camera).
+			if (std::isnan(startFirst) || std::isnan(startThird)) {
+				WriteRuntimeCameraFOV(s->firstPersonFOV.load(),
+					s->thirdPersonFOV.load(),
+					"RuntimeCorrect/instant");
+				LogEngineSnapshot("RuntimeCorrect/end");
+				activeLerps.fetch_sub(1);
+				return;
+			}
+
+			const float targetFirst = s->firstPersonFOV.load();
+			const float targetThird = s->thirdPersonFOV.load();
+
+			const auto t0       = std::chrono::steady_clock::now();
+			const auto duration = std::chrono::milliseconds(std::max(8, durationMs));
+			const auto step     = std::chrono::milliseconds(std::max(1, stepMs));
+			const float durMsF  = static_cast<float>(duration.count());
+
+			while (true) {
+				if (interpGeneration.load() != myGen) {
+					activeLerps.fetch_sub(1);
+					return;
+				}
+
+				const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now() - t0);
+				if (elapsed >= duration) break;
+
+				const float t = std::clamp(static_cast<float>(elapsed.count()) / durMsF, 0.0f, 1.0f);
+				const float fp = startFirst + (targetFirst - startFirst) * t;
+				const float wp = startThird + (targetThird - startThird) * t;
+				// Pure runtime write - no INI, no fov X Y, no FSRF.
+				WriteRuntimeCameraFOV(fp, wp, "RuntimeCorrect/step");
+				std::this_thread::sleep_for(step);
+			}
+
+			// Final exact write so float drift can't leave us short.
+			WriteRuntimeCameraFOV(targetFirst, targetThird, "RuntimeCorrect/final");
+
+			LogEngineSnapshot("RuntimeCorrect/end");
+			activeLerps.fetch_sub(1);
+		}).detach();
+	}
+
 	bool FOVManager::ExecuteConsoleCommand(std::string_view a_command, const char* a_caller)
 	{
 		// Same recipe as FPInertia's WeaponFOV.cpp:
@@ -494,9 +575,22 @@ namespace FOVSlider
 				if (settings->driftAutoCorrect.load()) {
 					const int durMs = std::max(50,
 						settings->driftCorrectDurationMs.load());
-					logger::warn("[FOVSlider] DRIFT auto-correct: lerping {:.2f} -> {:.2f} over {} ms",
+					logger::warn("[FOVSlider] DRIFT auto-correct: runtime-lerp {:.2f} -> {:.2f} over {} ms",
 						reportedEngine, saved, durMs);
-					LerpAllSettings(durMs, 8);
+					// Use SmoothCorrectRuntimeFOV (NOT LerpAllSettings):
+					// runtime-only lerp that does NOT issue `fov X Y`,
+					// does NOT touch INI, and does NOT dispatch FSRF.
+					// Going through the full apply chain here creates
+					// a feedback loop with FPInertia: our final
+					// `fov X Y` clobbers PlayerCamera::firstPersonFOV
+					// via the engine quirk (X overwrites both camera
+					// fields), our post-undo fixes it, but the FSRF
+					// then triggers FPInertia to re-apply its WBFOV,
+					// which clobbers runtime AGAIN (FPInertia has no
+					// runtime undo), watcher detects drift, loops.
+					// The user reported this as "constant fov lerping
+					// and popping" with WBFOV=30.
+					SmoothCorrectRuntimeFOV(durMs, 8);
 
 					// Suppress polls until the lerp definitely
 					// finishes AND FPInertia has had a tick to read
@@ -885,13 +979,13 @@ namespace FOVSlider
 	// script every call), so we issue it ONCE at the end with the
 	// final Y = saved camera FOV. FPInertia then re-reads the engine
 	// value on its next tick.
-	void FOVManager::LerpAllSettings(int durationMs, int stepMs)
+	void FOVManager::LerpAllSettings(int durationMs, int stepMs, bool a_includeViewmodel)
 	{
 		// Cancel any in-flight interpolation. Anyone holding the old
 		// `myGen` will see interpGeneration change and bail.
 		const std::uint64_t myGen = ++interpGeneration;
 
-		std::thread([this, myGen, durationMs, stepMs]() {
+		std::thread([this, myGen, durationMs, stepMs, a_includeViewmodel]() {
 			auto* s = Settings::GetSingleton();
 
 			activeLerps.fetch_add(1);
@@ -964,16 +1058,19 @@ namespace FOVSlider
 			ApplyFirstPersonFOV(targetFirst);
 			ApplyThirdPersonFOV(targetThird);
 
-			// One viewmodel apply at the end so FPInertia and the
-			// runtime camera see our viewmodel FOV with the freshly
-			// settled camera Y. Reset the dedup cache so the apply
-			// can't be skipped.
-			lastAppliedCamera.store(-1.0f);
-			lastAppliedViewmodel.store(-1.0f);
-			ApplyViewmodelFOV(GetTargetViewmodelFOV());
-			NotifyFPInertia();
+			// Optional finalizer: viewmodel apply + FPInertia refresh.
+			// See header docs - Phase 2 load retries pass false to
+			// avoid retriggering FPInertia's WBFOV apply (which would
+			// clobber the runtime camera fields via the engine's
+			// `fov X Y` quirk on every retry).
+			if (a_includeViewmodel) {
+				lastAppliedCamera.store(-1.0f);
+				lastAppliedViewmodel.store(-1.0f);
+				ApplyViewmodelFOV(GetTargetViewmodelFOV());
+				NotifyFPInertia();
+			}
 
-			LogEngineSnapshot("LerpAll/end");
+			LogEngineSnapshot(a_includeViewmodel ? "LerpAll/end" : "LerpAll/end(camera-only)");
 			activeLerps.fetch_sub(1);
 		}).detach();
 	}
@@ -1037,9 +1134,18 @@ namespace FOVSlider
 
 			for (int i = 0; i < count; ++i) {
 				std::this_thread::sleep_for(std::chrono::duration<float>(interval));
-				logger::info("[FOVSlider] Game-load safety retry {}/{} (smooth, {} ms)",
+				logger::info("[FOVSlider] Game-load safety retry {}/{} (smooth camera-only, {} ms)",
 					i + 1, count, kRetryLerp);
-				LerpAllSettings(kRetryLerp, 8);
+				// Camera-only: skip ApplyViewmodelFOV + FSRF on retries.
+				// The first phase already set viewmodel + refreshed
+				// FPInertia; retries are only here to catch DELAYED
+				// engine writes to fDefault1stPersonFOV:Display from
+				// cell-load triggers / scripted intros. Re-issuing
+				// `fov X Y` on each retry would clobber runtime back
+				// to our default vm (engine quirk) and re-trigger
+				// FPInertia's WBFOV apply, causing visible camera
+				// pops every retry interval.
+				LerpAllSettings(kRetryLerp, 8, /*a_includeViewmodel=*/false);
 			}
 			LogEngineSnapshot("LoadRetry/done");
 		}).detach();
