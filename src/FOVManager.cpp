@@ -1215,6 +1215,16 @@ namespace FOVSlider
 			logger::info("[FOVSlider] OnPipBoyOpening (skipped - in PA)");
 			return;
 		}
+		// If the user hasn't configured a distinct Pip-Boy FOV, there's nothing
+		// to change. Skip the lock/lerp/unlock entirely so FPInertia remains
+		// free to react to weapon swaps done via the Pip-Boy favorites screen.
+		const float fromVm = s->viewmodelFOV.load();
+		const float toVm   = s->pipBoyFOV.load();
+		if (std::fabs(fromVm - toVm) < 0.05f) {
+			logger::trace("[FOVSlider] OnPipBoyOpening - skipped (pipBoyFOV == viewmodelFOV)");
+			return;
+		}
+
 		logger::info("[FOVSlider] OnPipBoyOpening - context Default -> PipBoy");
 		LogEngineSnapshot("PipBoyOpening/before");
 
@@ -1223,8 +1233,6 @@ namespace FOVSlider
 		// Lock FIRST so FPInertia stops applying before our lerp begins.
 		NotifyFPInertiaLock(true);
 
-		const float fromVm = s->viewmodelFOV.load();
-		const float toVm   = s->pipBoyFOV.load();
 		InterpolateViewmodelFOV(fromVm, toVm, s->interpFramesFast.load());
 
 		// Re-assert 3rd-person FOV in case anything reset it.
@@ -1238,14 +1246,22 @@ namespace FOVSlider
 			logger::info("[FOVSlider] OnPipBoyClosing (skipped - in PA)");
 			return;
 		}
+		const float fromVm = s->pipBoyFOV.load();
+		const float toVm   = s->viewmodelFOV.load();
+		if (std::fabs(fromVm - toVm) < 0.05f) {
+			// We never entered PipBoy context (open was skipped), so there's
+			// nothing to restore. The drift watcher covers any transient engine
+			// camera reset that can happen on Pip-Boy close.
+			logger::trace("[FOVSlider] OnPipBoyClosing - skipped (pipBoyFOV == viewmodelFOV)");
+			return;
+		}
+
 		logger::info("[FOVSlider] OnPipBoyClosing - context PipBoy -> Default");
 		LogEngineSnapshot("PipBoyClosing/before");
 
 		std::lock_guard lock(transitionMtx);
 		context.store(FOVContext::Default);
 
-		const float fromVm = s->pipBoyFOV.load();
-		const float toVm   = s->viewmodelFOV.load();
 		InterpolateViewmodelFOV(fromVm, toVm, s->interpFrames.load());
 
 		// On close, the engine sometimes momentarily resets the camera
