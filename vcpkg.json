@@ -1,0 +1,18 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "fov-slider-f4se",
+  "version-string": "1.0.0",
+  "description": "Replacement for Simple FOV Slider as a native F4SE plugin built on F4SE Menu Framework 3, with first-class WBFOV interop with FPInertia.",
+  "license": "MIT",
+  "dependencies": [
+    "boost-stl-interfaces",
+    "boost-iostreams",
+    "boost-iterator",
+    "boost-predef",
+    "fmt",
+    "frozen",
+    "rsm-mmio",
+    "spdlog",
+    "xbyak"
+  ]
+}

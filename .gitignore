@@ -1,0 +1,41 @@
+# ---- Build / output ----
+build/
+out/
+Compile/
+install/
+.cache/
+.vs/
+*.dll
+*.pdb
+*.lib
+*.exp
+*.ilk
+*.obj
+*.user
+*.suo
+*.opendb
+*.idb
+*.iobj
+*.ipdb
+*.tlog
+*.log
+
+# ---- vcpkg ----
+vcpkg_installed/
+
+# ---- CMake ----
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake-build-*/
+compile_commands.json
+
+# ---- IDE ----
+.vscode/
+.idea/
+*.code-workspace
+
+# ---- OS ----
+Thumbs.db
+desktop.ini
+.DS_Store
