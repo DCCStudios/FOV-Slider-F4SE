@@ -256,6 +256,34 @@ namespace FOVSlider
 		// override doesn't fight the in-flight transition.
 		void ScheduleFPInertiaUnlock(int ms);
 
+	public:
+		// Set by main.cpp once kPostPostLoad has resolved the plugin
+		// list. When true, FPInertia is the authoritative owner of the
+		// runtime PlayerCamera fields (firstPersonFOV / worldFOV) and
+		// of the viewmodel projection: it issues `fov X Y` for WBFOV,
+		// it does the post-fov runtime undo. Our plugin's role
+		// shrinks to maintaining the INI source-of-truth (so
+		// camera-mode transitions and save loads pick up the right
+		// value) and notifying FPInertia of setting changes.
+		//
+		// Why a hard split: the engine quirk in `fov X Y` clobbers
+		// PlayerCamera::firstPersonFOV and worldFOV to the X arg
+		// (viewmodel). FPInertia issues `fov X Y` on a periodic
+		// timedReapply (~1.5 s) to keep WBFOV alive. If WE also
+		// write the runtime camera fields (B3), we either:
+		//   - fight FPInertia's intended camera state and clobber
+		//     it back to OUR saved value, or
+		//   - drag the viewmodel projection along with our world
+		//     camera write, which the user perceives as "WBFOV
+		//     value being stomped".
+		// Either way both plugins fight, the user sees a 250 ms
+		// lerp ramp every 1.5 s and the viewmodel size flickers.
+		// Letting FPInertia own runtime + viewmodel completely
+		// removes the fight.
+		std::atomic<bool> fpInertiaPresent{ false };
+
+	private:
+
 		// ---- State ----
 		std::atomic<FOVContext> context{ FOVContext::Default };
 

@@ -90,10 +90,12 @@ namespace
 		case F4SE::MessagingInterface::kPostPostLoad:
 			// Other plugins are now loaded - safe to log dependency status.
 			if (auto info = F4SE::GetPluginInfo("FPInertia"); info.has_value()) {
-				logger::info("[FOVSlider] FPInertia v{} detected - viewmodel FOV will hand off to its WBFOV when an entry exists",
+				logger::info("[FOVSlider] FPInertia v{} detected - viewmodel FOV will hand off to its WBFOV when an entry exists; runtime PlayerCamera FOV ownership delegated to FPInertia",
 					info->version);
+				FOVSlider::FOVManager::GetSingleton()->fpInertiaPresent.store(true);
 			} else {
 				logger::info("[FOVSlider] FPInertia not detected - viewmodel FOV is owned solely by this plugin");
+				FOVSlider::FOVManager::GetSingleton()->fpInertiaPresent.store(false);
 			}
 			break;
 

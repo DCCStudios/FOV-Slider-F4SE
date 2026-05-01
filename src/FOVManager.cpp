@@ -149,6 +149,33 @@ namespace FOVSlider
 	                                       float a_worldFOV,
 	                                       const char* a_caller)
 	{
+		// FPInertia ownership gate. When FPInertia is loaded it issues
+		// `fov X Y` on a ~1.5 s timedReapply for WBFOV, which clobbers
+		// PlayerCamera::firstPersonFOV / worldFOV to the X arg (engine
+		// quirk - the Y arg only updates the INI). FPInertia is responsible
+		// for undoing that runtime clobber after each `fov X Y` to keep
+		// the world camera at the user's preferred value.
+		//
+		// If WE also write these fields, two things go wrong:
+		//   1. Our drift watcher catches FPInertia's clobber, lerps
+		//      runtime back to our saved camera FOV, and triggers
+		//      another `fov X Y` cycle - the visible "every 1.5 s
+		//      the camera ramps 30 -> 105 again" feedback loop.
+		//   2. The runtime camera write drags the viewmodel projection
+		//      with it (the engine couples viewmodel rendering to
+		//      PlayerCamera::firstPersonFOV until `fov X Y` re-decouples
+		//      them), which the user perceives as WBFOV being stomped.
+		//
+		// So when FPInertia is loaded, all our runtime writes are
+		// no-ops. The drift watcher still flags drift to the log
+		// (visibility) but auto-correct is also a no-op.
+		if (FOVManager::GetSingleton()->fpInertiaPresent.load()) {
+			if (Settings::GetSingleton()->logEveryEngineWrite.load()) {
+				logger::trace("[FOVSlider] [{}] WriteRuntimeCameraFOV skipped (FPInertia owns runtime)", a_caller);
+			}
+			return false;
+		}
+
 		auto* camera = RE::PlayerCamera::GetSingleton();
 		if (!camera) return false;
 
@@ -536,11 +563,22 @@ namespace FOVSlider
 			// uses). Either drifting from saved is "real" drift the user
 			// will eventually see, but the runtime field is the more
 			// directly visible one.
+			//
+			// NOTE: when FPInertia is loaded, runtime drift is EXPECTED
+			// every ~1.5 s (FPInertia's timedReapply issues `fov X Y`
+			// for WBFOV, which clobbers PlayerCamera::firstPersonFOV
+			// to the X arg). FPInertia owns the runtime undo in that
+			// case. We still want INI drift detection (engine restore
+			// on save load can still hit the INI path), so we read
+			// INI either way - we just skip the runtime read when
+			// FPInertia is present, so the watcher only flags REAL
+			// problems (INI drift, which only the engine causes).
 			float eFov     = 0.0f;
 			float runFov   = 0.0f;
 			float runThird = 0.0f;
+			const bool fpiPresent = fpInertiaPresent.load();
 			const bool haveIni = TryReadEngineFloatSetting("fDefault1stPersonFOV:Display", eFov);
-			const bool haveRun = ReadRuntimeCameraFOV(runFov, runThird);
+			const bool haveRun = !fpiPresent && ReadRuntimeCameraFOV(runFov, runThird);
 			if (!haveIni && !haveRun) continue;
 
 			const float saved = Settings::GetSingleton()->firstPersonFOV.load();
@@ -575,31 +613,45 @@ namespace FOVSlider
 				if (settings->driftAutoCorrect.load()) {
 					const int durMs = std::max(50,
 						settings->driftCorrectDurationMs.load());
-					logger::warn("[FOVSlider] DRIFT auto-correct: runtime-lerp {:.2f} -> {:.2f} over {} ms",
-						reportedEngine, saved, durMs);
-					// Use SmoothCorrectRuntimeFOV (NOT LerpAllSettings):
-					// runtime-only lerp that does NOT issue `fov X Y`,
-					// does NOT touch INI, and does NOT dispatch FSRF.
-					// Going through the full apply chain here creates
-					// a feedback loop with FPInertia: our final
-					// `fov X Y` clobbers PlayerCamera::firstPersonFOV
-					// via the engine quirk (X overwrites both camera
-					// fields), our post-undo fixes it, but the FSRF
-					// then triggers FPInertia to re-apply its WBFOV,
-					// which clobbers runtime AGAIN (FPInertia has no
-					// runtime undo), watcher detects drift, loops.
-					// The user reported this as "constant fov lerping
-					// and popping" with WBFOV=30.
-					SmoothCorrectRuntimeFOV(durMs, 8);
+					if (fpiPresent) {
+						// FPInertia present: only the INI source-of-truth
+						// is ours to fix. Runtime PlayerCamera fields are
+						// FPInertia's responsibility (post-`fov X Y`
+						// undo). A snap INI write is enough - the engine
+						// re-reads INI on the next camera-mode transition,
+						// and FPInertia's next `fov X Y` will pick up the
+						// corrected Y arg from our INI.
+						logger::warn("[FOVSlider] DRIFT auto-correct (INI-only, FPInertia owns runtime): {:.2f} -> {:.2f}",
+							reportedEngine, saved);
+						SetEngineFloatSetting("fDefault1stPersonFOV:Display", saved, "DriftAutoCorrect");
+						SetEngineFloatSetting("fDefaultWorldFOV:Display",
+							Settings::GetSingleton()->thirdPersonFOV.load(),
+							"DriftAutoCorrect");
+						// Short suppress window so we don't double-fire on
+						// the same drift before the engine settles.
+						suppressCycles = 2;
+					} else {
+						logger::warn("[FOVSlider] DRIFT auto-correct: runtime-lerp {:.2f} -> {:.2f} over {} ms",
+							reportedEngine, saved, durMs);
+						// Use SmoothCorrectRuntimeFOV (NOT LerpAllSettings):
+						// runtime-only lerp that does NOT issue `fov X Y`,
+						// does NOT touch INI, and does NOT dispatch FSRF.
+						// Going through the full apply chain here would
+						// create a feedback loop with FPInertia (loop is
+						// also avoided structurally by the fpiPresent
+						// branch above; this path only runs when FPInertia
+						// is absent and we're the sole runtime owner).
+						SmoothCorrectRuntimeFOV(durMs, 8);
 
-					// Suppress polls until the lerp definitely
-					// finishes AND FPInertia has had a tick to read
-					// back the corrected value. ceil(dur / interval)
-					// + 1 = at least one full poll past the lerp end.
-					// Use the CURRENT interval (could be hot or cold)
-					// so the suppress window matches the actual poll
-					// rate.
-					suppressCycles = (durMs + interval - 1) / interval + 1;
+						// Suppress polls until the lerp definitely
+						// finishes AND FPInertia has had a tick to read
+						// back the corrected value. ceil(dur / interval)
+						// + 1 = at least one full poll past the lerp end.
+						// Use the CURRENT interval (could be hot or cold)
+						// so the suppress window matches the actual poll
+						// rate.
+						suppressCycles = (durMs + interval - 1) / interval + 1;
+					}
 				}
 			} else if (wasDrifting) {
 				logger::info("[FOVSlider] DRIFT cleared: 1stPersonFOV now ini={:.2f} runtime={:.2f} (saved={:.2f})",
