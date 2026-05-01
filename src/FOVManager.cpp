@@ -1316,10 +1316,16 @@ namespace FOVSlider
 		logger::info("[FOVSlider] OnSightedStateEnter - context Default -> Aiming");
 		LogEngineSnapshot("SightedEnter/before");
 		context.store(FOVContext::Aiming);
-		// We change the camera FOV during ADS, not the viewmodel FOV,
-		// so we DON'T need to lock FPInertia (it doesn't touch camera
-		// FOV). Leaving FPInertia free during ADS preserves per-weapon
-		// viewmodel FOV overrides while the user is aiming.
+
+		// Lock FPInertia for the duration of ADS. Although ADS only changes
+		// the 1st-person camera FOV (INI fDefault1stPersonFOV:Display) and
+		// not the viewmodel projection, FPInertia's `fov X Y` reapply also
+		// rewrites that same INI key (Y arg + an explicit
+		// SetEngineFloatSetting fixup), which would clobber our aim INI
+		// value back to the default camera FOV ~1.5 s into ADS. Locking
+		// FPInertia keeps it from re-issuing `fov X Y` during ADS so the
+		// aim FOV holds for the whole zoom.
+		NotifyFPInertiaLock(true);
 
 		// Ironsight FOV is a camera-FOV change, not a viewmodel-FOV
 		// change. Smooth it ourselves so we get a nicer ADS-snap than the
@@ -1355,7 +1361,8 @@ namespace FOVSlider
 		std::lock_guard lock(transitionMtx);
 		// Only reset if we're still in Aiming context - PipBoy/Terminal
 		// might have taken over via a separate transition.
-		if (context.load() == FOVContext::Aiming) {
+		const bool wasAiming = (context.load() == FOVContext::Aiming);
+		if (wasAiming) {
 			logger::info("[FOVSlider] OnSightedStateExit - context Aiming -> Default");
 			LogEngineSnapshot("SightedExit/before");
 			context.store(FOVContext::Default);
@@ -1382,6 +1389,19 @@ namespace FOVSlider
 				FOVManager::SetEngineFloatSetting("fDefault1stPersonFOV:Display", to, "AimLerp(out)Final");
 			}
 		}).detach();
+
+		// Release the FPInertia lock once our exit lerp has finished
+		// settling the camera FOV back to the default 1st-person value.
+		// We delay the unlock so FPInertia's first post-ADS `fov X Y`
+		// observes the final INI value (Y arg = camera FOV) rather than
+		// an in-flight intermediate. Only release if we actually held the
+		// lock (transitioned out of Aiming) - if PipBoy/Terminal took
+		// over mid-aim, that overlay owns the lock now and will release
+		// it itself.
+		if (wasAiming) {
+			const int unlockMs = std::max(0, steps) * 6 + 50;
+			ScheduleFPInertiaUnlock(unlockMs);
+		}
 	}
 
 	// ============================================================
