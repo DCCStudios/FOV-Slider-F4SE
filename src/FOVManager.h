@@ -31,15 +31,50 @@ namespace FOVSlider
 		// Called once at plugin init (before kPostLoadGame fires).
 		void Init();
 
-		// Apply ALL settings from scratch. Used on game load and when the
-		// user toggles a global option.
+		// Apply ALL settings from scratch INSTANTLY. Used by the menu
+		// "Re-apply All" button and by callers that need an immediate
+		// hard-set (e.g. the very first kGameDataReady apply, before
+		// the player can see anything).
 		void ApplyAllSettings();
+
+		// Smoothly lerp the engine's camera FOV settings from their
+		// current values to the saved targets over `durationMs` ms,
+		// stepping every `stepMs` ms (default 8 = ~1 frame at 120 fps).
+		// Used both by the game-load burst and by the drift watcher's
+		// auto-correct, so any post-load FOV restore by the engine is
+		// pulled back smoothly instead of snapping.
+		//
+		// Settings that don't visibly transition (3rd-person aim FOV,
+		// near distance) are applied instantly at the start.
+		// Settings that DO transition (1st-person FOV, 3rd-person
+		// world FOV) are lerped per-step.
+		// Viewmodel FOV is applied via `fov X Y` ONCE at the end so
+		// we don't recompile the console script every 8 ms.
+		// Cancels any in-flight lerp via the interpGeneration counter.
+		// Spawns a detached worker thread; returns immediately.
+		void LerpAllSettings(int durationMs, int stepMs = 8);
 
 		// Schedule a deferred re-apply of all settings to defeat the
 		// engine's late camera initialization on game load. Spawns a
-		// detached worker that calls ApplyAllSettings() N times spaced
-		// out by the configured retry interval.
+		// detached worker that runs the smooth load-lerp followed by
+		// slower safety retries (each retry is also a smooth lerp).
 		void ScheduleLoadRetry();
+
+		// Engage the drift watcher's "hot poll" mode for `durationMs`
+		// ms (clamped to at least 100 ms). During the hot window, the
+		// watcher polls every `iDriftWatchHotIntervalMs` (default 16 ms,
+		// = 1 frame at 60 fps) instead of `iDriftWatchIntervalMs`
+		// (default 50 ms), so engine stray-writes get detected and
+		// corrected within a single frame.
+		//
+		// Called by event handlers on menus that are known to trigger
+		// engine FOV restores - LoadingMenu close, FaderMenu close,
+		// ExamineMenu close (workbench teardown). Multiple calls are
+		// idempotent in that the deadline is set to MAX(existing,
+		// now + durationMs), so back-to-back triggers (e.g.
+		// LoadingMenu → FaderMenu) keep the hot window alive without
+		// shortening it.
+		void TriggerDriftHotMode(int durationMs);
 
 		// ---- Setting-change callbacks (one per slider) ----
 		// These are how the menu UI informs the manager that the user moved
@@ -75,6 +110,29 @@ namespace FOVSlider
 		// Compute the camera (1st-person world) FOV that should be active.
 		float GetTargetCameraFOV() const;
 
+		// ---- Debug introspection ----
+		// Last X/Y arguments we passed to a `fov X Y` console command.
+		// -1.0f means "never applied since plugin init / last reset".
+		// Used by the debug popout window so the user can spot a stale
+		// runtime camera FOV (engine setting vs runtime mismatch).
+		float GetLastAppliedViewmodel() const { return lastAppliedViewmodel.load(); }
+		float GetLastAppliedCamera() const    { return lastAppliedCamera.load(); }
+
+		// Read a live engine float setting. Wraps the same code path
+		// the apply primitives use, exposed so the debug window can
+		// poll without duplicating the collection-walk.
+		static bool ReadEngineFloatSetting(const char* a_key, float& a_out)
+		{
+			return TryReadEngineFloatSetting(a_key, a_out);
+		}
+
+		// Dump a snapshot of all four FOV-related engine settings to the
+		// log along with our saved values, prefixed by `a_phase`. Use
+		// this at every interesting boundary (game-load entry/exit,
+		// every context transition entry/exit, every animation event)
+		// so you can grep the log and reconstruct the timeline.
+		void LogEngineSnapshot(const char* a_phase) const;
+
 	private:
 		FOVManager() = default;
 
@@ -84,7 +142,12 @@ namespace FOVSlider
 		// Utility::SetINIFloat - it updates the in-memory value that the
 		// engine itself reads every frame, so changes apply instantly with
 		// no INI disk write or restart needed.
-		static bool SetEngineFloatSetting(const char* a_key, float a_value);
+		//
+		// `a_caller` tags the call site so the diagnostics log can
+		// pinpoint who clobbered the value. Pass a short literal like
+		// "ApplyFirstPersonFOV" or "BurstStep".
+		static bool SetEngineFloatSetting(const char* a_key, float a_value,
+		                                  const char* a_caller = "?");
 
 		// Read a float setting from any of the engine's INI/GameSetting
 		// collections. Returns false if the key is absent.
@@ -93,8 +156,41 @@ namespace FOVSlider
 		// Run a console command via the engine's ScriptCompiler. Same
 		// pipeline Papyrus mods use through ConsoleUtilF4 - the only
 		// reliable way to set just the viewmodel FOV via `fov X Y` without
-		// touching the world camera FOV.
-		static bool ExecuteConsoleCommand(std::string_view a_cmd);
+		// touching the world camera FOV. `a_caller` tags the call site
+		// for the diagnostics log.
+		static bool ExecuteConsoleCommand(std::string_view a_cmd,
+		                                  const char* a_caller = "?");
+
+		// Write the runtime camera FOV fields on PlayerCamera directly.
+		// These (offsets 0x168 / 0x16C) are the values the renderer reads
+		// every frame - the engine copies INI -> runtime on certain
+		// transitions, but otherwise the runtime stays at whatever was
+		// last set via `fov X Y` or a direct write.
+		//
+		// Returns false if PlayerCamera isn't available (very early init,
+		// MainMenu before world is ready). The two arguments are
+		// optional in the sense that NaN means "don't touch this field".
+		//
+		// Why this matters: a smooth lerp on the INI value is INVISIBLE
+		// because the renderer doesn't read INI per frame. Calling this
+		// from each lerp step makes the lerp actually visible, and also
+		// front-runs any engine "restore from save" write since the
+		// next step (8 ms later) will overwrite it.
+		static bool WriteRuntimeCameraFOV(float a_firstPersonFOV,
+		                                  float a_worldFOV,
+		                                  const char* a_caller = "?");
+
+		// Read the runtime camera FOV fields. Same caveats as Write -
+		// returns false if PlayerCamera is null.
+		static bool ReadRuntimeCameraFOV(float& a_firstPersonFOV,
+		                                 float& a_worldFOV);
+
+		// Background thread spawned on Init() (when iDriftWatchIntervalMs
+		// > 0). Polls the engine's `fDefault1stPersonFOV:Display` and
+		// emits a WARN log line whenever it drifts >0.5 deg from our
+		// saved firstPersonFOV value. The canonical "who is writing 90
+		// behind my back" detector.
+		void RunDriftWatcher();
 
 		// Apply primitives - safe to call from main thread.
 		void ApplyFirstPersonFOV(float fov);
@@ -146,5 +242,31 @@ namespace FOVSlider
 		// when nothing changed.
 		std::atomic<float> lastAppliedViewmodel{ -1.0f };
 		std::atomic<float> lastAppliedCamera{ -1.0f };
+
+		// Drift watcher control. We launch the thread once on Init();
+		// `driftWatcherStop` lets it exit cleanly on plugin teardown
+		// (not currently called - F4SE plugins don't have a teardown
+		// hook - but the variable is here for future use).
+		std::atomic<bool>  driftWatcherStarted{ false };
+		std::atomic<bool>  driftWatcherStop{ false };
+
+		// Counter incremented on entry to LerpAllSettings and
+		// decremented on exit. The drift watcher checks this and
+		// skips drift detection while a lerp is running, otherwise
+		// the lerp's own mid-transition writes (e.g. 92 deg while
+		// lerping 90 -> 105) would look like drift and trigger a
+		// recursive auto-correct.
+		std::atomic<int>   activeLerps{ 0 };
+
+		// Steady-clock deadline (in ms-since-epoch) for the drift
+		// watcher's hot-poll mode. The watcher uses
+		// `iDriftWatchHotIntervalMs` while now < deadline,
+		// `iDriftWatchIntervalMs` otherwise. 0 = hot mode never
+		// engaged (cold polling only).
+		//
+		// Stored as int64_t (ms count) rather than time_point because
+		// std::atomic<time_point> requires extra trait checks and the
+		// ms representation is sufficient for our 16 ms+ resolution.
+		std::atomic<std::int64_t> driftHotDeadlineMs{ 0 };
 	};
 }

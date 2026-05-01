@@ -57,6 +57,78 @@ namespace FOVSlider
 		std::atomic<int>   loadRetryCount{ 6 };
 		std::atomic<float> loadRetryInterval{ 0.5f };
 
+		// ---- Diagnostics ----
+		// `bVerboseLogging` controls the spdlog level at runtime. When
+		// true (default), every state transition, console command, and
+		// engine setting write is logged at info/trace level. Set to
+		// false in production-quality runs once the FOV pop is gone.
+		std::atomic<bool> verboseLogging{ true };
+
+		// `bLogEveryEngineWrite` causes EVERY in-memory INI write
+		// (SetEngineFloatSetting) to log a line. Useful for diagnosing
+		// "who is clobbering my FOV?" - turn this on, reproduce the
+		// drift, and grep the log for the exact write that introduced
+		// the wrong value. Off by default because the load burst
+		// alone can issue ~250 writes per game load.
+		std::atomic<bool> logEveryEngineWrite{ false };
+
+		// `bLogEveryConsoleCommand` logs every `fov X Y` we issue.
+		// Cheap; on by default. Disable only if you're chasing a
+		// non-FOV-related bug and the noise is in the way.
+		std::atomic<bool> logEveryConsoleCommand{ true };
+
+		// `iDriftWatchIntervalMs` runs a background thread that polls
+		// `fDefault1stPersonFOV:Display` every N ms. It emits a WARN
+		// log line whenever the engine value differs from our saved
+		// value by more than 0.5 deg, AND - if `bDriftAutoCorrect` is
+		// true (default) - smoothly lerps the engine value back to
+		// pull it back. This is what defeats the engine's
+		// late post-load FOV re-init (which fires 2-4 seconds after
+		// kPostLoadGame, well after our scheduled retries end) and
+		// any other external agent that overwrites the FOV at runtime.
+		// Set to 0 to disable polling entirely.
+		//
+		// Default 50 ms = 20 polls/sec; gives ~3-4 frame detection at
+		// 60 fps. Each poll is one INI-collection lookup + one float
+		// compare, well under 1 us, so the CPU cost is negligible.
+		std::atomic<int> driftWatchIntervalMs{ 50 };
+
+		// `iDriftWatchHotIntervalMs` - tighter polling interval used
+		// for `iDriftWatchHotDurationMs` ms after specific menu-close
+		// events (LoadingMenu, FaderMenu, ExamineMenu) where we know
+		// the engine is about to write its default FOVs. Default 16 ms
+		// = 1 frame at 60 fps so we catch the engine's stray writes
+		// within a single frame. Outside the hot window the watcher
+		// reverts to `iDriftWatchIntervalMs`.
+		std::atomic<int> driftWatchHotIntervalMs{ 16 };
+
+		// `iDriftWatchHotDurationMs` - how long the hot-poll mode stays
+		// engaged after a trigger event (in ms). The engine can do FOV
+		// restores up to ~2 seconds AFTER LoadingMenu/FaderMenu close,
+		// and up to ~1.7 seconds after ExamineMenu close (workbench
+		// teardown), so 3500 ms is a safe upper bound for all observed
+		// cases. Each trigger event resets the hot deadline to
+		// `now + this duration`, so back-to-back triggers (e.g.
+		// LoadingMenu then FaderMenu) keep the hot window alive.
+		std::atomic<int> driftWatchHotDurationMs{ 3500 };
+
+		// `bDriftAutoCorrect` - when the drift watcher detects drift
+		// (and we are NOT in Aiming context, where the camera FOV is
+		// intentionally different), smoothly lerp the engine values
+		// back to our saved targets. Covers all three drift modes the
+		// diagnostic log identified (engine post-load FOV restore,
+		// savegame state restore, and any other mod's stray write).
+		// On by default.
+		std::atomic<bool> driftAutoCorrect{ true };
+
+		// `iDriftCorrectDurationMs` - how long the auto-correct lerp
+		// takes (in ms). Same lerp shape as the load burst, just on a
+		// shorter timeline since the player is in active gameplay.
+		// Default 250 = 1/4 second; smooth enough to be invisible at
+		// 60 fps, fast enough that the user doesn't notice the FOV
+		// shifting.
+		std::atomic<int> driftCorrectDurationMs{ 250 };
+
 		// ---- IO ----
 		// Returns the resolved INI path (next to the DLL).
 		std::filesystem::path GetIniPath() const;

@@ -25,14 +25,26 @@ namespace
 
 		auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(path->string(), true);
 		auto log  = std::make_shared<spdlog::logger>("global", std::move(sink));
-#ifdef NDEBUG
+		// Start at info; the actual level is applied AFTER Settings::Load
+		// so the user-configurable [Diagnostics] bVerboseLogging takes
+		// effect on the very first session.
 		log->set_level(spdlog::level::info);
 		log->flush_on(spdlog::level::info);
-#else
-		log->set_level(spdlog::level::trace);
-		log->flush_on(spdlog::level::trace);
-#endif
 		set_default_logger(std::move(log));
+	}
+
+	// Re-apply the spdlog level based on the loaded settings. Called
+	// after Settings::Load so the user can flip verbosity in the INI
+	// without needing a debug build.
+	void ApplyLogLevelFromSettings()
+	{
+		const bool verbose = FOVSlider::Settings::GetSingleton()->verboseLogging.load();
+		const auto lvl     = verbose ? spdlog::level::trace : spdlog::level::info;
+		spdlog::set_level(lvl);
+		spdlog::flush_on(lvl);
+		logger::info("[FOVSlider] Log level set to {} ({})",
+			verbose ? "trace" : "info",
+			verbose ? "bVerboseLogging=true" : "bVerboseLogging=false");
 	}
 
 	// ============================================================
@@ -46,9 +58,11 @@ namespace
 		case F4SE::MessagingInterface::kGameDataReady:
 			logger::info("[FOVSlider] kGameDataReady - initializing");
 			FOVSlider::Settings::GetSingleton()->Load();
+			ApplyLogLevelFromSettings();
 			FOVSlider::FOVManager::GetSingleton()->Init();
 			FOVSlider::RegisterEventSinks();
 			FOVSlider::Menu::Register();
+			FOVSlider::FOVManager::GetSingleton()->LogEngineSnapshot("kGameDataReady/before-apply");
 			// Apply initial state. The world camera FOV won't have been
 			// fully initialized yet on cold-boot, but the apply will land
 			// once kPostLoadGame / kNewGame retries kick in.
@@ -57,8 +71,11 @@ namespace
 
 		case F4SE::MessagingInterface::kPostLoadGame:
 		case F4SE::MessagingInterface::kNewGame:
-			logger::info("[FOVSlider] kPostLoadGame / kNewGame - re-applying settings");
+			logger::info("[FOVSlider] {} - re-applying settings",
+				msg->type == F4SE::MessagingInterface::kPostLoadGame ? "kPostLoadGame" : "kNewGame");
 			FOVSlider::Settings::GetSingleton()->Load();
+			ApplyLogLevelFromSettings();
+			FOVSlider::FOVManager::GetSingleton()->LogEngineSnapshot("PostLoadGame/before");
 			FOVSlider::OnGameLoaded();
 			// ScheduleLoadRetry is the single entry point for game-load
 			// FOV application now - it runs an aggressive frame-paced

@@ -13,6 +13,19 @@ namespace FOVSlider
 	static constexpr std::uint32_t kFPInertia_RefreshMsg = 0x46535246;  // 'FSRF'
 	static constexpr std::uint32_t kFPInertia_LockMsg    = 0x46534C4B;  // 'FSLK'
 
+	// Helper for the diagnostics log. Free function so both
+	// FOVManager::LogEngineSnapshot and the drift watcher can use it.
+	static const char* ContextToString(FOVContext c)
+	{
+		switch (c) {
+			case FOVContext::Default:  return "Default";
+			case FOVContext::PipBoy:   return "PipBoy";
+			case FOVContext::Terminal: return "Terminal";
+			case FOVContext::Aiming:   return "Aiming";
+			default:                   return "?";
+		}
+	}
+
 	// ============================================================
 	// Engine-setting helpers
 	// ============================================================
@@ -42,36 +55,140 @@ namespace FOVSlider
 		return false;
 	}
 
-	bool FOVManager::SetEngineFloatSetting(const char* a_key, float a_value)
+	bool FOVManager::SetEngineFloatSetting(const char* a_key, float a_value, const char* a_caller)
 	{
+		// Capture the prior value so the diagnostics log shows
+		// before/after - lets us see if a "redundant" write was
+		// actually correcting drift introduced by another agent.
+		float prior = std::numeric_limits<float>::quiet_NaN();
+		(void)TryReadEngineFloatSetting(a_key, prior);
+
+		const auto* settings = Settings::GetSingleton();
+		const bool  shouldLog = settings->logEveryEngineWrite.load();
+
 		// Try INIPrefSettingCollection first (the Papyrus Utility::SetINIFloat
 		// path also resolves here for "*:Display" keys).
+		bool ok = false;
+		const char* hitCollection = "?";
+
 		if (auto* prefs = RE::INIPrefSettingCollection::GetSingleton()) {
 			if (auto* s = prefs->GetSetting(a_key); s && s->GetType() == RE::Setting::SETTING_TYPE::kFloat) {
 				s->SetFloat(a_value);
-				return true;
+				ok = true;
+				hitCollection = "Pref";
 			}
 		}
-		if (auto* ini = RE::INISettingCollection::GetSingleton()) {
-			if (auto* s = ini->GetSetting(a_key); s && s->GetType() == RE::Setting::SETTING_TYPE::kFloat) {
-				s->SetFloat(a_value);
-				return true;
-			}
-		}
-		if (auto* gs = RE::GameSettingCollection::GetSingleton()) {
-			for (auto& kv : gs->settings) {
-				if (kv.second && kv.second->GetKey() == a_key &&
-				    kv.second->GetType() == RE::Setting::SETTING_TYPE::kFloat) {
-					kv.second->SetFloat(a_value);
-					return true;
+		if (!ok) {
+			if (auto* ini = RE::INISettingCollection::GetSingleton()) {
+				if (auto* s = ini->GetSetting(a_key); s && s->GetType() == RE::Setting::SETTING_TYPE::kFloat) {
+					s->SetFloat(a_value);
+					ok = true;
+					hitCollection = "INI";
 				}
 			}
 		}
-		logger::warn("[FOVSlider] Engine setting '{}' not found - couldn't apply {:.2f}", a_key, a_value);
-		return false;
+		if (!ok) {
+			if (auto* gs = RE::GameSettingCollection::GetSingleton()) {
+				for (auto& kv : gs->settings) {
+					if (kv.second && kv.second->GetKey() == a_key &&
+					    kv.second->GetType() == RE::Setting::SETTING_TYPE::kFloat) {
+						kv.second->SetFloat(a_value);
+						ok = true;
+						hitCollection = "GameSetting";
+						break;
+					}
+				}
+			}
+		}
+
+		if (!ok) {
+			logger::warn("[FOVSlider] [{}] Engine setting '{}' not found - couldn't apply {:.2f}",
+				a_caller, a_key, a_value);
+			return false;
+		}
+
+		if (shouldLog) {
+			logger::info("[FOVSlider] [{}] WRITE {} {:.2f} -> {:.2f} ({})",
+				a_caller, a_key, prior, a_value, hitCollection);
+		}
+		return true;
 	}
 
-	bool FOVManager::ExecuteConsoleCommand(std::string_view a_command)
+	// ============================================================
+	// PlayerCamera runtime FOV (the actually-rendered values)
+	// ============================================================
+	//
+	// PlayerCamera carries its own `worldFOV` (3rd-person) and
+	// `firstPersonFOV` floats at offsets 0x168 / 0x16C. The renderer
+	// reads THESE every frame; the INI keys we usually write
+	// (`fDefault1stPersonFOV:Display`, etc.) are merely *sources* the
+	// engine copies into these runtime fields on certain transitions
+	// (camera mode change, save load, scripted FOV adjusts, etc.).
+	//
+	// That decoupling is why a "smooth lerp on the INI value" looks
+	// like a snap to the user: the lerp's per-step INI writes don't
+	// reach the renderer until something issues `fov X Y`, at which
+	// point the runtime jumps from its last-set value straight to
+	// the lerp's final value.
+	//
+	// Writing the runtime fields directly is therefore not the same
+	// kind of "engine hook" you'd expect (no detour, no Address
+	// Library lookup) - it's just a direct memory write to a public
+	// member CommonLibF4 already exposes. Cost: one branch + two
+	// 4-byte stores. Visible effect: the renderer picks up the new
+	// value on its next frame.
+	//
+	// Caveat: writing `firstPersonFOV` also drags the viewmodel
+	// projection along until something issues `fov X Y` to
+	// re-decouple them. We accept this for short lerps because the
+	// alternative (snap the camera 30 deg) is worse than briefly
+	// having the viewmodel match the camera. The lerp's final
+	// ApplyViewmodelFOV() reasserts the user's preferred viewmodel
+	// FOV.
+	bool FOVManager::WriteRuntimeCameraFOV(float a_firstPersonFOV,
+	                                       float a_worldFOV,
+	                                       const char* a_caller)
+	{
+		auto* camera = RE::PlayerCamera::GetSingleton();
+		if (!camera) return false;
+
+		const bool wantWriteFirst = !std::isnan(a_firstPersonFOV);
+		const bool wantWriteThird = !std::isnan(a_worldFOV);
+		if (!wantWriteFirst && !wantWriteThird) return true;
+
+		const bool shouldLog = Settings::GetSingleton()->logEveryEngineWrite.load();
+
+		const float priorFirst = camera->firstPersonFOV;
+		const float priorThird = camera->worldFOV;
+
+		if (wantWriteFirst) camera->firstPersonFOV = a_firstPersonFOV;
+		if (wantWriteThird) camera->worldFOV       = a_worldFOV;
+
+		if (shouldLog) {
+			if (wantWriteFirst && wantWriteThird) {
+				logger::info("[FOVSlider] [{}] WRITE PlayerCamera 1stP {:.2f}->{:.2f} 3rdP {:.2f}->{:.2f}",
+					a_caller, priorFirst, a_firstPersonFOV, priorThird, a_worldFOV);
+			} else if (wantWriteFirst) {
+				logger::info("[FOVSlider] [{}] WRITE PlayerCamera::firstPersonFOV {:.2f}->{:.2f}",
+					a_caller, priorFirst, a_firstPersonFOV);
+			} else {
+				logger::info("[FOVSlider] [{}] WRITE PlayerCamera::worldFOV {:.2f}->{:.2f}",
+					a_caller, priorThird, a_worldFOV);
+			}
+		}
+		return true;
+	}
+
+	bool FOVManager::ReadRuntimeCameraFOV(float& a_firstPersonFOV, float& a_worldFOV)
+	{
+		auto* camera = RE::PlayerCamera::GetSingleton();
+		if (!camera) return false;
+		a_firstPersonFOV = camera->firstPersonFOV;
+		a_worldFOV       = camera->worldFOV;
+		return true;
+	}
+
+	bool FOVManager::ExecuteConsoleCommand(std::string_view a_command, const char* a_caller)
 	{
 		// Same recipe as FPInertia's WeaponFOV.cpp:
 		//   1. ConcreteFormFactory<RE::Script>::Create()
@@ -81,12 +198,12 @@ namespace FOVSlider
 		//   4. Suppress the console-history line so we don't spam.
 		auto* factory = RE::ConcreteFormFactory<RE::Script>::GetFormFactory();
 		if (!factory) {
-			logger::warn("[FOVSlider] Script form factory unavailable - cannot run '{}'", a_command);
+			logger::warn("[FOVSlider] [{}] Script form factory unavailable - cannot run '{}'", a_caller, a_command);
 			return false;
 		}
 		auto* script = factory->Create();
 		if (!script) {
-			logger::warn("[FOVSlider] Script create failed - cannot run '{}'", a_command);
+			logger::warn("[FOVSlider] [{}] Script create failed - cannot run '{}'", a_caller, a_command);
 			return false;
 		}
 
@@ -104,9 +221,67 @@ namespace FOVSlider
 		delete script;
 
 		if (!ok) {
-			logger::warn("[FOVSlider] Failed to compile '{}'", a_command);
+			logger::warn("[FOVSlider] [{}] Failed to compile '{}'", a_caller, a_command);
+			return false;
 		}
-		return ok;
+
+		if (Settings::GetSingleton()->logEveryConsoleCommand.load()) {
+			logger::info("[FOVSlider] [{}] EXEC `{}`", a_caller, a_command);
+		}
+		return true;
+	}
+
+	// ============================================================
+	// Snapshot diagnostics - the single most useful tool for
+	// reconstructing what happened to the engine FOV settings during
+	// a failed transition. Reads all four FOV-related INI values
+	// and dumps them next to our saved values, prefixed with `phase`.
+	// ============================================================
+	void FOVManager::LogEngineSnapshot(const char* a_phase) const
+	{
+		const auto* s = Settings::GetSingleton();
+
+		float e1stFOV = std::numeric_limits<float>::quiet_NaN();
+		float eWorldFOV = std::numeric_limits<float>::quiet_NaN();
+		float eAim3rdFOV = std::numeric_limits<float>::quiet_NaN();
+		float eNearDist  = std::numeric_limits<float>::quiet_NaN();
+
+		const bool h1   = TryReadEngineFloatSetting("fDefault1stPersonFOV:Display", e1stFOV);
+		const bool h3   = TryReadEngineFloatSetting("fDefaultWorldFOV:Display",     eWorldFOV);
+		const bool ha3  = TryReadEngineFloatSetting("f3rdPersonAimFOV:Camera",      eAim3rdFOV);
+		const bool hnd  = TryReadEngineFloatSetting("fNearDistance:Display",        eNearDist);
+
+		const float saved1   = s->firstPersonFOV.load();
+		const float saved3   = s->thirdPersonFOV.load();
+		const float savedAim = s->thirdPersonAimFOV.load();
+		const float savedND  = s->cameraDistance.load();
+
+		// Also read PlayerCamera runtime fields (the actually-rendered
+		// values). When INI != runtime the user sees the runtime value;
+		// they're the canonical "what's on screen" answer.
+		float runFirst = std::numeric_limits<float>::quiet_NaN();
+		float runThird = std::numeric_limits<float>::quiet_NaN();
+		const bool hr = ReadRuntimeCameraFOV(runFirst, runThird);
+
+		// Log on a single line per setting so the user can trivially
+		// grep e.g. "1stPersonFOV" and see the timeline.
+		logger::info("[FOVSlider] SNAPSHOT [{}] 1stPersonFOV: saved={:.2f} ini={} runtime={} ctx={} ",
+			a_phase, saved1,
+			h1 ? std::format("{:.2f}", e1stFOV) : "<missing>",
+			hr ? std::format("{:.2f}", runFirst) : "<missing>",
+			ContextToString(context.load()));
+		logger::info("[FOVSlider] SNAPSHOT [{}] WorldFOV(3rd):  saved={:.2f} ini={} runtime={}",
+			a_phase, saved3,
+			h3 ? std::format("{:.2f}", eWorldFOV) : "<missing>",
+			hr ? std::format("{:.2f}", runThird) : "<missing>");
+		logger::info("[FOVSlider] SNAPSHOT [{}] 3rdPersonAim:   saved={:.2f} ini={}",
+			a_phase, savedAim,
+			ha3 ? std::format("{:.2f}", eAim3rdFOV) : "<missing>");
+		logger::info("[FOVSlider] SNAPSHOT [{}] NearDist:       saved={:.2f} ini={}",
+			a_phase, savedND,
+			hnd ? std::format("{:.2f}", eNearDist) : "<missing>");
+		logger::info("[FOVSlider] SNAPSHOT [{}] LastAppliedFov: vmX={:.2f} camY={:.2f}",
+			a_phase, lastAppliedViewmodel.load(), lastAppliedCamera.load());
 	}
 
 	// ============================================================
@@ -117,6 +292,228 @@ namespace FOVSlider
 		context.store(FOVContext::Default);
 		lastAppliedViewmodel.store(-1.0f);
 		lastAppliedCamera.store(-1.0f);
+
+		// Initial snapshot - shows what state the engine is in BEFORE
+		// we apply anything on first kGameDataReady. If the engine
+		// reports 90 here even though our saved is 105, we know the
+		// engine pre-init defaults are at play.
+		LogEngineSnapshot("Init");
+
+		// Spawn the drift watcher (controlled by INI; 0 = disabled).
+		const auto* settings = Settings::GetSingleton();
+		const int   interval = settings->driftWatchIntervalMs.load();
+		if (interval > 0 && !driftWatcherStarted.exchange(true)) {
+			std::thread([this]() { RunDriftWatcher(); }).detach();
+			logger::info("[FOVSlider] Drift watcher started (cold={} ms, hot={} ms, hotDuration={} ms)",
+				interval,
+				settings->driftWatchHotIntervalMs.load(),
+				settings->driftWatchHotDurationMs.load());
+		}
+	}
+
+	// ============================================================
+	// Drift watcher hot-mode trigger
+	// ============================================================
+	//
+	// Engages the hot-poll mode for `durationMs` ms. Called by event
+	// handlers immediately after menu-close events that the diagnostic
+	// log identified as triggers for engine FOV restores:
+	//   - LoadingMenu close: engine writes 75 to all FOVs ~700 ms later
+	//   - FaderMenu close:   engine writes 90/70 ~470 ms later
+	//   - ExamineMenu close: engine writes 90/70 ~1.7 s later
+	//
+	// The deadline is set to MAX(existing, now + durationMs) so
+	// back-to-back triggers extend the window without ever shortening
+	// it. Calling this with durationMs <= 0 is a no-op (and lets a
+	// caller "disable" the next trigger by passing 0 if they later
+	// decide they don't want it).
+	void FOVManager::TriggerDriftHotMode(int durationMs)
+	{
+		if (durationMs <= 0) return;
+		// Clamp to at least 100 ms so a typo doesn't render the API
+		// useless. Upper bound is open - the cost is one extra atomic
+		// load + compare per poll.
+		durationMs = std::max(100, durationMs);
+
+		const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+		const auto wantDeadline = nowMs + static_cast<std::int64_t>(durationMs);
+
+		// CAS-loop to set deadline = max(existing, wantDeadline).
+		std::int64_t cur = driftHotDeadlineMs.load();
+		while (cur < wantDeadline &&
+		       !driftHotDeadlineMs.compare_exchange_weak(cur, wantDeadline)) {
+			// `cur` was reloaded by compare_exchange_weak on failure;
+			// loop again with the fresh value.
+		}
+
+		logger::info("[FOVSlider] Drift watcher: hot mode requested for {} ms (deadline={} ms)",
+			durationMs, wantDeadline);
+	}
+
+	// ============================================================
+	// Drift watcher
+	//
+	// Polls `fDefault1stPersonFOV:Display` every iDriftWatchIntervalMs
+	// (default 250 ms). When the engine value differs from our saved
+	// firstPersonFOV by > 0.5 deg, we:
+	//   1. WARN-log the drift with a one-line summary AND a full
+	//      snapshot (only on transition into drift, not every tick).
+	//   2. If bDriftAutoCorrect is true (default), kick off a smooth
+	//      LerpAllSettings(iDriftCorrectDurationMs) to ease the
+	//      engine values back to saved. This is what defeats the
+	//      engine's post-LoadingMenu/FaderMenu FOV restore - which
+	//      fires 2-4 seconds AFTER our scheduled retries end (proven
+	//      via diagnostic logs) - and any external mod that writes
+	//      the FOV behind our back. The lerp shape matches Pip-Boy /
+	//      iron sights / game-load so the user sees a brief FOV ease
+	//      back to target instead of a snap.
+	//
+	// Suppressions:
+	//  - We DON'T flag drift while context == Aiming, because Aiming
+	//    intentionally drives a different camera FOV.
+	//  - We DO flag/correct drift while in PipBoy or Terminal (the
+	//    camera FOV should still match the user's preference, only
+	//    the viewmodel FOV is overlaid in those contexts).
+	//  - We skip drift detection entirely while activeLerps > 0 so
+	//    the lerp's own mid-transition writes (e.g. 92 deg while
+	//    lerping 90 -> 105) don't look like drift.
+	//  - We dedupe consecutive identical drift values so a stable-
+	//    but-wrong engine value logs ONCE, not every poll.
+	//  - After auto-correcting, we suppress polls for ceil(durMs/
+	//    interval)+1 cycles so the lerp finishes AND FPInertia has
+	//    one full poll to read back the corrected value.
+	// ============================================================
+	void FOVManager::RunDriftWatcher()
+	{
+		float    lastDriftEngineValue = std::numeric_limits<float>::quiet_NaN();
+		bool     wasDrifting          = false;
+		int      suppressCycles       = 0;
+		bool     wasHotLastTick       = false;
+
+		const auto nowMs = []() {
+			return std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count();
+		};
+
+		while (!driftWatcherStop.load()) {
+			auto* settings = Settings::GetSingleton();
+
+			const int  coldInterval = settings->driftWatchIntervalMs.load();
+			const int  hotInterval  = std::max(1, settings->driftWatchHotIntervalMs.load());
+			const bool inHot        = nowMs() < driftHotDeadlineMs.load();
+
+			if (coldInterval <= 0 && !inHot) {
+				// Watcher disabled and not in a hot window - sleep
+				// briefly and re-check (so toggling the setting at
+				// runtime doesn't require a restart).
+				std::this_thread::sleep_for(std::chrono::milliseconds(500));
+				continue;
+			}
+
+			const int interval = inHot ? hotInterval : std::max(1, coldInterval);
+			std::this_thread::sleep_for(std::chrono::milliseconds(interval));
+
+			// Log transitions in/out of hot mode so the user can
+			// correlate detection latency with menu lifecycle.
+			if (inHot != wasHotLastTick) {
+				if (inHot) {
+					logger::info("[FOVSlider] Drift watcher: HOT mode engaged (poll {} ms)", hotInterval);
+				} else {
+					logger::info("[FOVSlider] Drift watcher: HOT mode ended, back to cold poll ({} ms)", coldInterval);
+				}
+				wasHotLastTick = inHot;
+			}
+
+			if (suppressCycles > 0) {
+				--suppressCycles;
+				continue;
+			}
+
+			// Skip while a lerp (load burst, drift auto-correct,
+			// safety retry) is in flight - the lerp's mid-transition
+			// writes are not "drift", they're our own intentional
+			// smooth values. Without this check, polling at 250 ms
+			// during a 250 ms lerp would see e.g. engine=98 vs
+			// saved=105 and trigger a recursive auto-correct.
+			if (activeLerps.load() > 0) {
+				continue;
+			}
+
+			// Aiming intentionally drives a different camera FOV;
+			// PipBoy / Terminal don't (only the viewmodel is overlaid
+			// in those contexts), so we DO check for camera-FOV drift
+			// there.
+			if (context.load() == FOVContext::Aiming) {
+				wasDrifting          = false;
+				lastDriftEngineValue = std::numeric_limits<float>::quiet_NaN();
+				continue;
+			}
+
+			// Read BOTH the INI setting (engine's source-of-truth) and
+			// the PlayerCamera runtime field (what the renderer actually
+			// uses). Either drifting from saved is "real" drift the user
+			// will eventually see, but the runtime field is the more
+			// directly visible one.
+			float eFov     = 0.0f;
+			float runFov   = 0.0f;
+			float runThird = 0.0f;
+			const bool haveIni = TryReadEngineFloatSetting("fDefault1stPersonFOV:Display", eFov);
+			const bool haveRun = ReadRuntimeCameraFOV(runFov, runThird);
+			if (!haveIni && !haveRun) continue;
+
+			const float saved = Settings::GetSingleton()->firstPersonFOV.load();
+			const float deltaIni = haveIni ? std::fabs(eFov - saved)   : 0.0f;
+			const float deltaRun = haveRun ? std::fabs(runFov - saved) : 0.0f;
+
+			// Whichever is further off-target drives the report (so the
+			// log shows the worse of the two sources).
+			const float delta = std::max(deltaIni, deltaRun);
+			const float reportedEngine = (deltaRun >= deltaIni && haveRun) ? runFov : eFov;
+			const char* source         = (deltaRun >= deltaIni && haveRun) ? "runtime" : "INI";
+
+			if (delta > 0.5f) {
+				const bool sameAsLastReport = std::fabs(reportedEngine - lastDriftEngineValue) < 0.05f;
+				if (!sameAsLastReport) {
+					logger::warn("[FOVSlider] DRIFT detected ({}): 1stPersonFOV saved={:.2f} engine={:.2f} (delta={:.2f}, ini={:.2f} runtime={:.2f})",
+						source, saved, reportedEngine, delta,
+						haveIni ? eFov : 0.0f, haveRun ? runFov : 0.0f);
+					LogEngineSnapshot("DRIFT");
+					lastDriftEngineValue = reportedEngine;
+				}
+				wasDrifting = true;
+
+				// Auto-correct if enabled. We use the SAME smooth lerp
+				// shape as Pip-Boy / iron sights / game-load so the
+				// user sees a brief FOV ease back to the saved value
+				// instead of a snap. The lerp covers 1st- and
+				// 3rd-person FOV; the other settings (3rd-person aim
+				// FOV, near distance) get an instant re-apply at the
+				// start of the lerp because they don't visibly
+				// transition.
+				if (settings->driftAutoCorrect.load()) {
+					const int durMs = std::max(50,
+						settings->driftCorrectDurationMs.load());
+					logger::warn("[FOVSlider] DRIFT auto-correct: lerping {:.2f} -> {:.2f} over {} ms",
+						reportedEngine, saved, durMs);
+					LerpAllSettings(durMs, 8);
+
+					// Suppress polls until the lerp definitely
+					// finishes AND FPInertia has had a tick to read
+					// back the corrected value. ceil(dur / interval)
+					// + 1 = at least one full poll past the lerp end.
+					// Use the CURRENT interval (could be hot or cold)
+					// so the suppress window matches the actual poll
+					// rate.
+					suppressCycles = (durMs + interval - 1) / interval + 1;
+				}
+			} else if (wasDrifting) {
+				logger::info("[FOVSlider] DRIFT cleared: 1stPersonFOV now ini={:.2f} runtime={:.2f} (saved={:.2f})",
+					haveIni ? eFov : 0.0f, haveRun ? runFov : 0.0f, saved);
+				wasDrifting          = false;
+				lastDriftEngineValue = std::numeric_limits<float>::quiet_NaN();
+			}
+		}
 	}
 
 	// ============================================================
@@ -124,26 +521,34 @@ namespace FOVSlider
 	// ============================================================
 	void FOVManager::ApplyFirstPersonFOV(float fov)
 	{
-		// fDefault1stPersonFOV:Display lives in INIPrefSettingCollection
-		// (Fallout4Prefs.ini). Writing the in-memory value updates the
-		// camera every frame; no script command needed.
-		SetEngineFloatSetting("fDefault1stPersonFOV:Display", fov);
+		// 1) INI source-of-truth (read by engine on camera-mode
+		//    transitions / save load).
+		SetEngineFloatSetting("fDefault1stPersonFOV:Display", fov, "ApplyFirstPersonFOV");
+
+		// 2) Runtime PlayerCamera::firstPersonFOV (read by the renderer
+		//    every frame). Without this the INI write is INVISIBLE until
+		//    something forces the engine to copy INI -> runtime - which
+		//    is what was making our smooth lerps look like snaps.
+		WriteRuntimeCameraFOV(fov, std::numeric_limits<float>::quiet_NaN(),
+			"ApplyFirstPersonFOV");
 	}
 
 	void FOVManager::ApplyThirdPersonFOV(float fov)
 	{
-		SetEngineFloatSetting("fDefaultWorldFOV:Display", fov);
+		SetEngineFloatSetting("fDefaultWorldFOV:Display", fov, "ApplyThirdPersonFOV");
+		WriteRuntimeCameraFOV(std::numeric_limits<float>::quiet_NaN(), fov,
+			"ApplyThirdPersonFOV");
 	}
 
 	void FOVManager::ApplyThirdPersonAimFOV(float fov)
 	{
 		// Lives in GameSettingCollection (esm-defined default key).
-		SetEngineFloatSetting("f3rdPersonAimFOV:Camera", fov);
+		SetEngineFloatSetting("f3rdPersonAimFOV:Camera", fov, "ApplyThirdPersonAimFOV");
 	}
 
 	void FOVManager::ApplyCameraDistance(float distance)
 	{
-		SetEngineFloatSetting("fNearDistance:Display", distance);
+		SetEngineFloatSetting("fNearDistance:Display", distance, "ApplyCameraDistance");
 	}
 
 	void FOVManager::ApplyViewmodelFOV(float vmFov)
@@ -172,9 +577,23 @@ namespace FOVSlider
 		}
 
 		const std::string cmd = std::format("fov {:.4f} {:.4f}", vmFov, camFov);
-		if (ExecuteConsoleCommand(cmd)) {
+		if (ExecuteConsoleCommand(cmd, "ApplyViewmodelFOV")) {
 			lastAppliedViewmodel.store(vmFov);
 			lastAppliedCamera.store(camFov);
+
+			// Engine quirk (documented in the Player Height mod's
+			// FOVSliderScript.psc): `fov X Y` sets the runtime
+			// VIEWMODEL and 3rd-person camera FOV to X, and the
+			// 1st-person camera FOV to Y. So after the command runs,
+			// `PlayerCamera::worldFOV` has been clobbered to X
+			// (= viewmodel value, not the saved 3rd-person FOV).
+			//
+			// Re-assert the saved 3rd-person FOV here so a 1st->3rd
+			// camera transition doesn't briefly show the viewmodel
+			// value. Also re-assert 1st-person to defend against any
+			// secondary engine writes that race the console command.
+			const float savedThird = Settings::GetSingleton()->thirdPersonFOV.load();
+			WriteRuntimeCameraFOV(camFov, savedThird, "ApplyViewmodelFOV/post-fov");
 		}
 	}
 
@@ -256,6 +675,47 @@ namespace FOVSlider
 		// aiming - aiming has its own value.
 		if (context.load() != FOVContext::Aiming || !Settings::GetSingleton()->enableFirstPersonAimFOV.load()) {
 			ApplyFirstPersonFOV(v);
+
+			// Force the runtime camera FOV to refresh immediately via
+			// `fov X Y`. Without this, there's a visible 1-frame FOV
+			// pop on every slider tick.
+			//
+			// Why: `ApplyFirstPersonFOV` above writes
+			// `fDefault1stPersonFOV:Display` in INIPrefSettingCollection,
+			// but the engine doesn't re-sync the runtime camera FOV
+			// from INI per frame - only on certain events (camera mode
+			// transitions). Until something issues `fov X Y`, the
+			// renderer keeps using whatever runtime value was last
+			// set, which equals the OLD slider value.
+			//
+			// FPInertia would normally paper over this for us via its
+			// FSRF -> RefreshDefaults -> ApplyViewmodelFOV chain, but
+			// that's one frame too late (the message dispatch crosses
+			// a frame boundary), and it fires even when the user has
+			// WBFOV disabled - which is the "even with WBFOV disabled
+			// I still see the pop" symptom users hit.
+			//
+			// We issue `fov vmCurrent newCam` here, same-frame,
+			// directly. Runtime camera = newCam immediately. No pop.
+			//
+			// Caveat: `fov X Y` resets 3rd-person FOV to X (viewmodel)
+			// as a documented engine quirk. We gate this on the active
+			// camera state being 1st-person/iron-sights so we don't
+			// clobber a visible 3rd-person view; the engine re-reads
+			// `fDefaultWorldFOV:Display` on the next 1st->3rd
+			// transition so 3rd-person FOV recovers naturally either
+			// way.
+			if (auto* camera = RE::PlayerCamera::GetSingleton(); camera && camera->currentState) {
+				const auto state = camera->currentState->id.get();
+				if (state == RE::CameraState::kFirstPerson ||
+				    state == RE::CameraState::kIronSights) {
+					// Reset the dedup cache for camera so the apply
+					// can't be skipped (lastAppliedCamera == old
+					// camFov is exactly the case we need to defeat).
+					lastAppliedCamera.store(-1.0f);
+					ApplyViewmodelFOV(GetTargetViewmodelFOV());
+				}
+			}
 		}
 		NotifyFPInertia();
 	}
@@ -344,6 +804,8 @@ namespace FOVSlider
 	{
 		auto* s = Settings::GetSingleton();
 
+		LogEngineSnapshot("ApplyAllSettings/before");
+
 		// Camera (1st-person world) FOV. This is the value FPInertia's
 		// WeaponFOV picks up as the Y-arg of `fov X Y`, so we set it
 		// FIRST.
@@ -365,95 +827,197 @@ namespace FOVSlider
 		// Tell FPInertia to re-read its defaults so its WBFOV agrees with
 		// our refreshed viewmodel value.
 		NotifyFPInertia();
+
+		LogEngineSnapshot("ApplyAllSettings/after");
+	}
+
+	// ============================================================
+	// Smooth lerp re-apply
+	// ============================================================
+	//
+	// Drives a single ramp from the engine's CURRENT 1st-person /
+	// 3rd-person FOV values to our saved targets, stepping every
+	// `stepMs` ms (default 8 = ~1 frame at 120 fps) for `durationMs`
+	// total ms.
+	//
+	// Per step we write `start + (target - start) * t` for both the
+	// camera-collection 1st-person FOV and the world-collection
+	// 3rd-person FOV, where t = elapsed / total. This achieves two
+	// things at once:
+	//   (a) the user sees a smooth FOV ease, matching the Pip-Boy /
+	//       Terminal / iron-sights transitions everywhere else in the
+	//       plugin;
+	//   (b) the high-frequency writes ALSO defeat the engine's
+	//       post-load FOV restore (the original "load burst" purpose)
+	//       because any stray engine write is overwritten on the next
+	//       step ~8 ms later.
+	//
+	// Settings that don't visibly transition (3rd-person aim FOV,
+	// near distance) are applied instantly at the start - reading
+	// e.g. fNearDistance and lerping it across 250 ms would just be
+	// wasted writes since it doesn't move the camera.
+	//
+	// The viewmodel `fov X Y` command is heavy (compiles a Papyrus
+	// script every call), so we issue it ONCE at the end with the
+	// final Y = saved camera FOV. FPInertia then re-reads the engine
+	// value on its next tick.
+	void FOVManager::LerpAllSettings(int durationMs, int stepMs)
+	{
+		// Cancel any in-flight interpolation. Anyone holding the old
+		// `myGen` will see interpGeneration change and bail.
+		const std::uint64_t myGen = ++interpGeneration;
+
+		std::thread([this, myGen, durationMs, stepMs]() {
+			auto* s = Settings::GetSingleton();
+
+			activeLerps.fetch_add(1);
+			LogEngineSnapshot("LerpAll/start");
+
+			// Read the engine's CURRENT values so we can lerp from
+			// wherever we are. If they're already at target the
+			// lerp is a smooth no-op; if the engine reverted us to
+			// 90 deg the lerp is a smooth ramp 90 -> target.
+			//
+			// Prefer the PlayerCamera runtime value over the INI key:
+			// the runtime is what the user actually sees on screen,
+			// and the engine sometimes diverges the two (e.g. INI=105
+			// but runtime=75 right after LoadingMenu close). Lerping
+			// from "what the user sees right now" produces a smooth
+			// transition; lerping from the INI source-of-truth would
+			// look like a snap because the runtime hasn't been updated.
+			float startFirst = s->firstPersonFOV.load();
+			float startThird = s->thirdPersonFOV.load();
+			float runFirst   = std::numeric_limits<float>::quiet_NaN();
+			float runThird   = std::numeric_limits<float>::quiet_NaN();
+			(void)TryReadEngineFloatSetting("fDefault1stPersonFOV:Display", startFirst);
+			(void)TryReadEngineFloatSetting("fDefaultWorldFOV:Display",     startThird);
+			if (ReadRuntimeCameraFOV(runFirst, runThird)) {
+				if (!std::isnan(runFirst) && runFirst >= 30.0f && runFirst <= 160.0f) {
+					startFirst = runFirst;
+				}
+				if (!std::isnan(runThird) && runThird >= 30.0f && runThird <= 160.0f) {
+					startThird = runThird;
+				}
+			}
+
+			const float targetFirst = s->firstPersonFOV.load();
+			const float targetThird = s->thirdPersonFOV.load();
+
+			// Apply non-visible settings instantly at the start so
+			// they're correct for the entire lerp window (and any
+			// engine re-init that fires mid-lerp can't leave them
+			// stale).
+			ApplyThirdPersonAimFOV(s->thirdPersonAimFOV.load());
+			ApplyCameraDistance(s->cameraDistance.load());
+
+			const auto t0       = std::chrono::steady_clock::now();
+			const auto duration = std::chrono::milliseconds(std::max(8, durationMs));
+			const auto step     = std::chrono::milliseconds(std::max(1, stepMs));
+			const float durMsF  = static_cast<float>(duration.count());
+
+			while (true) {
+				if (interpGeneration.load() != myGen) {
+					// Superseded - another transition kicked off.
+					// Bail out without forcing the final value, since
+					// the new transition is already heading somewhere
+					// else.
+					activeLerps.fetch_sub(1);
+					return;
+				}
+
+				const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now() - t0);
+				if (elapsed >= duration) break;
+
+				const float t = std::clamp(static_cast<float>(elapsed.count()) / durMsF, 0.0f, 1.0f);
+				ApplyFirstPersonFOV(startFirst + (targetFirst - startFirst) * t);
+				ApplyThirdPersonFOV(startThird + (targetThird - startThird) * t);
+				std::this_thread::sleep_for(step);
+			}
+
+			// Final exact apply so floating-point drift can't leave
+			// us 0.1 deg short of the target.
+			ApplyFirstPersonFOV(targetFirst);
+			ApplyThirdPersonFOV(targetThird);
+
+			// One viewmodel apply at the end so FPInertia and the
+			// runtime camera see our viewmodel FOV with the freshly
+			// settled camera Y. Reset the dedup cache so the apply
+			// can't be skipped.
+			lastAppliedCamera.store(-1.0f);
+			lastAppliedViewmodel.store(-1.0f);
+			ApplyViewmodelFOV(GetTargetViewmodelFOV());
+			NotifyFPInertia();
+
+			LogEngineSnapshot("LerpAll/end");
+			activeLerps.fetch_sub(1);
+		}).detach();
 	}
 
 	// ============================================================
 	// Game-load retry loop
 	// ============================================================
 	//
-	// Why this is so aggressive:
-	//   The engine re-initializes the first-person camera FOV some time
-	//   AFTER kPostLoadGame fires (it reads camera state from the save,
-	//   then re-applies it during the first ~100-300 ms post-load). The
-	//   plain "apply once and retry every 500 ms" approach the original
-	//   Papyrus mod used leaves a clearly visible FOV pop in that gap.
+	// On game load the engine re-initializes the first-person camera
+	// FOV some time AFTER kPostLoadGame fires (it reads camera state
+	// from the save, then re-applies it during the first ~100-300 ms
+	// post-load). The plain "apply once" approach leaves a visible
+	// FOV pop in that gap.
 	//
-	//   The fix is a frame-paced micro-burst: re-assert the camera FOV
-	//   every ~8 ms (≈1 frame at 120 fps, 2 frames at 60 fps) for the
-	//   first 500 ms after load. Camera FOV is a memory write to
-	//   INIPrefSettingCollection, so hammering it costs essentially
-	//   nothing - and it guarantees the renderer reads OUR value on
-	//   every frame in that window, making the pop imperceptible.
+	// We hand the load-time apply off to LerpAllSettings, which:
+	//   - reads the engine's current camera FOV (whatever the engine
+	//     just initialized it to),
+	//   - lerps from there to our saved target over `iLoadBurstDurationMs`
+	//     (default 500 ms),
+	//   - hammers the engine setting every 8 ms in the process,
+	//     which is what defeats any concurrent engine writes.
 	//
-	//   Viewmodel FOV (the `fov X Y` console command) is expensive
-	//   because it goes through ScriptCompiler. We apply it once at the
-	//   start of the burst, once at the end, and then again as part of
-	//   the slower phase-2 retries. The viewmodel is also occluded by
-	//   the load-screen fade for most of the burst so a delayed apply
-	//   isn't visible anyway.
+	// The user gets a smooth ease from the engine's restored value to
+	// their preferred FOV - same lerp shape as Pip-Boy / iron sights /
+	// Terminal transitions - instead of a snap.
+	//
+	// After the lerp, slower phase-2 retries fire `iRetryCount` times
+	// `fRetryIntervalSec` apart. Each retry is also a smooth lerp,
+	// which catches delayed engine re-init passes (cell load triggers,
+	// scripted intro sequences) without snapping.
 	void FOVManager::ScheduleLoadRetry()
 	{
-		// Bump the generation so any in-flight interpolation can be
-		// canceled before the retries start fighting it.
-		++interpGeneration;
+		LogEngineSnapshot("ScheduleLoadRetry/queued");
 
 		std::thread([this]() {
 			auto* s = Settings::GetSingleton();
 
-			// ---- PHASE 1: frame-paced burst ----
-			// 8 ms steps = ~1 frame at 120 fps. Run for the full
-			// `iLoadBurstDurationMs` window (default 500 ms), which
-			// covers the engine's typical 100-300 ms re-init pass plus
-			// safety margin.
-			const auto burstStart = std::chrono::steady_clock::now();
-			const auto burstLen   = std::chrono::milliseconds(
-				std::max(50, s->loadBurstDurationMs.load()));
-			const auto burstStep  = std::chrono::milliseconds(
+			// ---- PHASE 1: smooth load-lerp ----
+			LerpAllSettings(
+				std::max(50, s->loadBurstDurationMs.load()),
 				std::max(1, s->loadBurstStepMs.load()));
 
-			// One viewmodel apply at the *start* of the burst so
-			// FPInertia and the engine see our viewmodel FOV before
-			// the load-screen fade ends. lastAppliedCamera is reset
-			// here so the dedup check inside ApplyViewmodelFOV doesn't
-			// suppress the apply on the next call.
-			lastAppliedCamera.store(-1.0f);
-			lastAppliedViewmodel.store(-1.0f);
-			ApplyViewmodelFOV(GetTargetViewmodelFOV());
+			// Wait for the lerp worker to finish so the snapshot
+			// below shows post-lerp values, not mid-lerp.
+			const auto lerpWait = std::chrono::milliseconds(
+				std::max(50, s->loadBurstDurationMs.load()) + 50);
+			std::this_thread::sleep_for(lerpWait);
 
-			while (std::chrono::steady_clock::now() - burstStart < burstLen) {
-				// These four are all cheap memory writes to the engine's
-				// in-memory INI / GameSetting collections - no script
-				// compile, no IO, no allocation. Spamming is fine.
-				ApplyFirstPersonFOV(s->firstPersonFOV.load());
-				ApplyThirdPersonFOV(s->thirdPersonFOV.load());
-				ApplyThirdPersonAimFOV(s->thirdPersonAimFOV.load());
-				ApplyCameraDistance(s->cameraDistance.load());
-				std::this_thread::sleep_for(burstStep);
-			}
+			logger::info("[FOVSlider] Load lerp complete ({} ms)",
+				static_cast<long long>(s->loadBurstDurationMs.load()));
 
-			// One viewmodel apply at the *end* of the burst as well -
-			// in case FPInertia / another mod issued `fov X Y` during
-			// the burst window and overwrote our hands FOV.
-			lastAppliedCamera.store(-1.0f);
-			lastAppliedViewmodel.store(-1.0f);
-			ApplyViewmodelFOV(GetTargetViewmodelFOV());
-			NotifyFPInertia();
+			// ---- PHASE 2: slow safety-net retries (each smooth) ----
+			// Catches delayed engine re-init passes that happen well
+			// after the initial save-load. Each retry is a quick
+			// 150 ms lerp instead of a snap so the user never sees a
+			// visible FOV pop even if the engine clobbered us in
+			// between retries.
+			const int   count        = std::max(1, s->loadRetryCount.load());
+			const float interval     = std::max(0.05f, s->loadRetryInterval.load());
+			constexpr int kRetryLerp = 150;
 
-			logger::trace("[FOVSlider] Load burst complete ({} ms, ~{} applies)",
-				static_cast<long long>(burstLen.count()),
-				static_cast<long long>(burstLen.count() / std::max<long long>(1, burstStep.count())));
-
-			// ---- PHASE 2: slow safety-net retries ----
-			// Catches delayed engine re-init passes (cell load triggers,
-			// scripted intro sequences) that happen well after the
-			// initial save-load. Cheap to keep around, no perf concern.
-			const int   count    = std::max(1, s->loadRetryCount.load());
-			const float interval = std::max(0.05f, s->loadRetryInterval.load());
 			for (int i = 0; i < count; ++i) {
 				std::this_thread::sleep_for(std::chrono::duration<float>(interval));
-				ApplyAllSettings();
-				logger::trace("[FOVSlider] Game-load safety retry {}/{} applied", i + 1, count);
+				logger::info("[FOVSlider] Game-load safety retry {}/{} (smooth, {} ms)",
+					i + 1, count, kRetryLerp);
+				LerpAllSettings(kRetryLerp, 8);
 			}
+			LogEngineSnapshot("LoadRetry/done");
 		}).detach();
 	}
 
@@ -465,7 +1029,12 @@ namespace FOVSlider
 		auto* s = Settings::GetSingleton();
 		// In Power Armor the pipboy is a HUD overlay that doesn't change
 		// the viewmodel - skip the override (matches the original mod).
-		if (IsPlayerInPowerArmor()) return;
+		if (IsPlayerInPowerArmor()) {
+			logger::info("[FOVSlider] OnPipBoyOpening (skipped - in PA)");
+			return;
+		}
+		logger::info("[FOVSlider] OnPipBoyOpening - context Default -> PipBoy");
+		LogEngineSnapshot("PipBoyOpening/before");
 
 		std::lock_guard lock(transitionMtx);
 		context.store(FOVContext::PipBoy);
@@ -483,7 +1052,12 @@ namespace FOVSlider
 	void FOVManager::OnPipBoyClosing()
 	{
 		auto* s = Settings::GetSingleton();
-		if (IsPlayerInPowerArmor()) return;
+		if (IsPlayerInPowerArmor()) {
+			logger::info("[FOVSlider] OnPipBoyClosing (skipped - in PA)");
+			return;
+		}
+		logger::info("[FOVSlider] OnPipBoyClosing - context PipBoy -> Default");
+		LogEngineSnapshot("PipBoyClosing/before");
 
 		std::lock_guard lock(transitionMtx);
 		context.store(FOVContext::Default);
@@ -509,6 +1083,9 @@ namespace FOVSlider
 	void FOVManager::OnTerminalEntered()
 	{
 		auto* s = Settings::GetSingleton();
+		logger::info("[FOVSlider] OnTerminalEntered - context -> Terminal");
+		LogEngineSnapshot("TerminalEntered/before");
+
 		std::lock_guard lock(transitionMtx);
 		context.store(FOVContext::Terminal);
 		NotifyFPInertiaLock(true);
@@ -521,6 +1098,9 @@ namespace FOVSlider
 	void FOVManager::OnTerminalExited()
 	{
 		auto* s = Settings::GetSingleton();
+		logger::info("[FOVSlider] OnTerminalExited - context Terminal -> Default");
+		LogEngineSnapshot("TerminalExited/before");
+
 		std::lock_guard lock(transitionMtx);
 		context.store(FOVContext::Default);
 
@@ -540,11 +1120,19 @@ namespace FOVSlider
 	void FOVManager::OnSightedStateEnter()
 	{
 		auto* s = Settings::GetSingleton();
-		if (!s->enableFirstPersonAimFOV.load()) return;
+		if (!s->enableFirstPersonAimFOV.load()) {
+			logger::trace("[FOVSlider] OnSightedStateEnter - skipped (aim FOV disabled)");
+			return;
+		}
 
 		std::lock_guard lock(transitionMtx);
 		// Don't override an already-active overlay (PipBoy/Terminal).
-		if (context.load() != FOVContext::Default) return;
+		if (context.load() != FOVContext::Default) {
+			logger::info("[FOVSlider] OnSightedStateEnter - skipped (context={})", ContextToString(context.load()));
+			return;
+		}
+		logger::info("[FOVSlider] OnSightedStateEnter - context Default -> Aiming");
+		LogEngineSnapshot("SightedEnter/before");
 		context.store(FOVContext::Aiming);
 		// We change the camera FOV during ADS, not the viewmodel FOV,
 		// so we DON'T need to lock FPInertia (it doesn't touch camera
@@ -565,11 +1153,11 @@ namespace FOVSlider
 				if (interpGeneration.load() != myGen) return;
 				const float t   = static_cast<float>(i + 1) / static_cast<float>(steps);
 				const float cur = from + delta * t;
-				SetEngineFloatSetting("fDefault1stPersonFOV:Display", cur);
+				SetEngineFloatSetting("fDefault1stPersonFOV:Display", cur, "AimLerp(in)");
 				std::this_thread::sleep_for(std::chrono::milliseconds(6));
 			}
 			if (interpGeneration.load() == myGen) {
-				SetEngineFloatSetting("fDefault1stPersonFOV:Display", to);
+				SetEngineFloatSetting("fDefault1stPersonFOV:Display", to, "AimLerp(in)Final");
 			}
 		}).detach();
 	}
@@ -577,13 +1165,21 @@ namespace FOVSlider
 	void FOVManager::OnSightedStateExit()
 	{
 		auto* s = Settings::GetSingleton();
-		if (!s->enableFirstPersonAimFOV.load()) return;
+		if (!s->enableFirstPersonAimFOV.load()) {
+			logger::trace("[FOVSlider] OnSightedStateExit - skipped (aim FOV disabled)");
+			return;
+		}
 
 		std::lock_guard lock(transitionMtx);
 		// Only reset if we're still in Aiming context - PipBoy/Terminal
 		// might have taken over via a separate transition.
 		if (context.load() == FOVContext::Aiming) {
+			logger::info("[FOVSlider] OnSightedStateExit - context Aiming -> Default");
+			LogEngineSnapshot("SightedExit/before");
 			context.store(FOVContext::Default);
+		} else {
+			logger::info("[FOVSlider] OnSightedStateExit - context unchanged ({})",
+				ContextToString(context.load()));
 		}
 
 		const float from = s->firstPersonAimFOV.load();
@@ -597,11 +1193,11 @@ namespace FOVSlider
 				if (FOVManager::GetSingleton()->interpGeneration.load() != myGen) return;
 				const float t   = static_cast<float>(i + 1) / static_cast<float>(steps);
 				const float cur = from + delta * t;
-				FOVManager::SetEngineFloatSetting("fDefault1stPersonFOV:Display", cur);
+				FOVManager::SetEngineFloatSetting("fDefault1stPersonFOV:Display", cur, "AimLerp(out)");
 				std::this_thread::sleep_for(std::chrono::milliseconds(6));
 			}
 			if (FOVManager::GetSingleton()->interpGeneration.load() == myGen) {
-				FOVManager::SetEngineFloatSetting("fDefault1stPersonFOV:Display", to);
+				FOVManager::SetEngineFloatSetting("fDefault1stPersonFOV:Display", to, "AimLerp(out)Final");
 			}
 		}).detach();
 	}

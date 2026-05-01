@@ -6,6 +6,7 @@ namespace FOVSlider
 	static constexpr const char* kSection_Display     = "Display";
 	static constexpr const char* kSection_Interp      = "Interpolation";
 	static constexpr const char* kSection_GameLoad    = "GameLoad";
+	static constexpr const char* kSection_Diagnostics = "Diagnostics";
 
 	std::filesystem::path Settings::GetIniPath() const
 	{
@@ -15,7 +16,13 @@ namespace FOVSlider
 
 	bool Settings::Load()
 	{
-		std::lock_guard lock(ioMtx);
+		// Track migration / first-write state outside the locked section
+		// so we can call Save() (which takes the same lock) afterward
+		// without deadlocking.
+		bool needPersist = false;
+
+		{
+			std::lock_guard lock(ioMtx);
 
 		const auto path = GetIniPath();
 
@@ -60,12 +67,37 @@ namespace FOVSlider
 		loadRetryCount.store(         getI(kSection_GameLoad, "iRetryCount",          6));
 		loadRetryInterval.store(      getF(kSection_GameLoad, "fRetryIntervalSec",    0.5f));
 
-		// Persist immediately if the file didn't exist or was malformed -
-		// this guarantees a well-formed file on disk for users to inspect.
-		if (!exists) {
-			// Release the lock before recursive Save()
-			ini.Reset();
+		verboseLogging.store(         getB(kSection_Diagnostics, "bVerboseLogging",        true));
+		logEveryEngineWrite.store(    getB(kSection_Diagnostics, "bLogEveryEngineWrite",   false));
+		logEveryConsoleCommand.store( getB(kSection_Diagnostics, "bLogEveryConsoleCommand", true));
+		driftWatchIntervalMs.store(    getI(kSection_Diagnostics, "iDriftWatchIntervalMs",   50));
+		driftWatchHotIntervalMs.store( getI(kSection_Diagnostics, "iDriftWatchHotIntervalMs", 16));
+		driftWatchHotDurationMs.store( getI(kSection_Diagnostics, "iDriftWatchHotDurationMs", 3500));
+		driftAutoCorrect.store(        getB(kSection_Diagnostics, "bDriftAutoCorrect",       true));
+		driftCorrectDurationMs.store(  getI(kSection_Diagnostics, "iDriftCorrectDurationMs", 250));
+
+		// ---- Migrate stale aggressive values from earlier dev iterations ----
+		// Prior versions of this plugin shipped with iDriftCorrectDurationMs=50
+		// (way too fast - the lerp looked like a snap) and
+		// iDriftWatchIntervalMs=250 (too slow to catch engine writes within
+		// a frame). Both are user-modifiable on disk, so we only migrate
+		// them when the value is "obviously the old default" - if the user
+		// deliberately set 60 ms because they wanted fast corrections, we
+		// leave it alone.
+		if (driftCorrectDurationMs.load() == 50) {
+			driftCorrectDurationMs.store(250);
+			logger::info("[FOVSlider] Migrated iDriftCorrectDurationMs 50 -> 250 (smoother lerp)");
+			needPersist = true;
 		}
+		if (driftWatchIntervalMs.load() == 250) {
+			driftWatchIntervalMs.store(50);
+			logger::info("[FOVSlider] Migrated iDriftWatchIntervalMs 250 -> 50 (faster cold poll)");
+			needPersist = true;
+		}
+
+		// Flag a persist if the file didn't exist - guarantees a
+		// well-formed file on disk for users to inspect.
+		if (!exists) needPersist = true;
 
 		logger::info("[FOVSlider] Loaded settings from '{}'", path.string());
 		logger::info("[FOVSlider]  1stP={:.1f} 3rdP={:.1f} VM={:.1f} PB={:.1f} TM={:.1f} ND={:.2f}",
@@ -74,6 +106,13 @@ namespace FOVSlider
 		logger::info("[FOVSlider]  AimEnabled={} 1stPAim={:.1f} 3rdPAim={:.1f}",
 			enableFirstPersonAimFOV.load(),
 			firstPersonAimFOV.load(), thirdPersonAimFOV.load());
+
+		}  // end of locked section
+
+		// Persist outside the lock to avoid deadlocking with Save().
+		if (needPersist) {
+			Save();
+		}
 
 		return true;
 	}
@@ -124,6 +163,15 @@ namespace FOVSlider
 		setI(kSection_GameLoad, "iLoadBurstStepMs",     loadBurstStepMs.load());
 		setI(kSection_GameLoad, "iRetryCount",          loadRetryCount.load());
 		setF(kSection_GameLoad, "fRetryIntervalSec",    loadRetryInterval.load());
+
+		setB(kSection_Diagnostics, "bVerboseLogging",         verboseLogging.load());
+		setB(kSection_Diagnostics, "bLogEveryEngineWrite",    logEveryEngineWrite.load());
+		setB(kSection_Diagnostics, "bLogEveryConsoleCommand", logEveryConsoleCommand.load());
+		setI(kSection_Diagnostics, "iDriftWatchIntervalMs",      driftWatchIntervalMs.load());
+		setI(kSection_Diagnostics, "iDriftWatchHotIntervalMs",   driftWatchHotIntervalMs.load());
+		setI(kSection_Diagnostics, "iDriftWatchHotDurationMs",   driftWatchHotDurationMs.load());
+		setB(kSection_Diagnostics, "bDriftAutoCorrect",          driftAutoCorrect.load());
+		setI(kSection_Diagnostics, "iDriftCorrectDurationMs",    driftCorrectDurationMs.load());
 
 		const SI_Error rc = ini.SaveFile(path.string().c_str());
 		if (rc < 0) {
