@@ -1161,9 +1161,18 @@ namespace FOVSlider
 			auto* s = Settings::GetSingleton();
 
 			// ---- PHASE 1: smooth load-lerp ----
+			// When FPInertia is present, skip the final `fov X Y` + FSRF
+			// in Phase 1. FPInertia already calls RefreshDefaults and runs
+			// its own LoadRetryBurst on kPostLoadGame, so it handles the
+			// viewmodel apply itself. Our `fov X Y` would clobber
+			// PlayerCamera::firstPersonFOV to the viewmodel value (engine
+			// quirk) AFTER the loading screen closes, causing a visible
+			// camera-FOV pop to the viewmodel value for every in-game load.
+			const bool includeVm = !fpInertiaPresent.load();
 			LerpAllSettings(
 				std::max(50, s->loadBurstDurationMs.load()),
-				std::max(1, s->loadBurstStepMs.load()));
+				std::max(1, s->loadBurstStepMs.load()),
+				includeVm);
 
 			// Wait for the lerp worker to finish so the snapshot
 			// below shows post-lerp values, not mid-lerp.
@@ -1200,6 +1209,13 @@ namespace FOVSlider
 				LerpAllSettings(kRetryLerp, 8, /*a_includeViewmodel=*/false);
 			}
 			LogEngineSnapshot("LoadRetry/done");
+
+			// Final FSRF so FPInertia re-reads our camera defaults after
+			// all retries have settled (only needed when Phase 1 skipped
+			// the viewmodel apply due to fpInertiaPresent).
+			if (fpInertiaPresent.load()) {
+				NotifyFPInertia();
+			}
 		}).detach();
 	}
 
