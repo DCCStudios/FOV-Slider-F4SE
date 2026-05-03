@@ -206,7 +206,17 @@ namespace FOVSlider::Menu
 		Spacing();
 		Separator();
 
-		if (Button("Re-apply All Settings")) {
+		if (Button("Save to INI")) {
+			Settings::GetSingleton()->Save();
+		}
+		if (IsItemHovered()) {
+			SetTooltip("Writes the current settings to FOV Slider F4SE.ini.\n"
+			           "Settings are also auto-saved whenever you move a\n"
+			           "slider, but this lets you commit a set of changes\n"
+			           "all at once.");
+		}
+		SameLine();
+		if (Button("Re-apply All")) {
 			fov->ApplyAllSettings();
 		}
 		if (IsItemHovered()) {
