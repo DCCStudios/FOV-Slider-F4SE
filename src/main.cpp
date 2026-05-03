@@ -69,22 +69,39 @@ namespace
 			FOVSlider::FOVManager::GetSingleton()->ApplyAllSettings();
 			break;
 
-		case F4SE::MessagingInterface::kPostLoadGame:
 		case F4SE::MessagingInterface::kNewGame:
-			logger::info("[FOVSlider] {} - re-applying settings",
-				msg->type == F4SE::MessagingInterface::kPostLoadGame ? "kPostLoadGame" : "kNewGame");
+			logger::info("[FOVSlider] kNewGame - resetting session load flag and applying settings");
 			FOVSlider::Settings::GetSingleton()->Load();
 			ApplyLogLevelFromSettings();
-			FOVSlider::FOVManager::GetSingleton()->LogEngineSnapshot("PostLoadGame/before");
+			// Fresh session: reset the flag so ScheduleLoadRetry runs
+			// the full initial-apply sequence, just like the first load.
+			FOVSlider::FOVManager::GetSingleton()->initialLoadApplied.store(false);
+			FOVSlider::FOVManager::GetSingleton()->LogEngineSnapshot("NewGame/before");
 			FOVSlider::OnGameLoaded();
-			// ScheduleLoadRetry is the single entry point for game-load
-			// FOV application now - it runs an aggressive frame-paced
-			// burst immediately on a worker thread, followed by slower
-			// safety retries. See FOVManager.cpp for the full strategy.
-			// (The previous design did one synchronous apply here and
-			// then retried every 500 ms, which left a visible FOV pop in
-			// the engine's ~100-300 ms post-load camera re-init window.)
 			FOVSlider::FOVManager::GetSingleton()->ScheduleLoadRetry();
+			break;
+
+		case F4SE::MessagingInterface::kPostLoadGame:
+			FOVSlider::Settings::GetSingleton()->Load();
+			ApplyLogLevelFromSettings();
+			FOVSlider::OnGameLoaded();
+			if (!FOVSlider::FOVManager::GetSingleton()->initialLoadApplied.load()) {
+				// First load in this session: full retry sequence to defeat
+				// the engine's late camera initialization window.
+				logger::info("[FOVSlider] kPostLoadGame - initial load, running ScheduleLoadRetry");
+				FOVSlider::FOVManager::GetSingleton()->LogEngineSnapshot("PostLoadGame-initial/before");
+				FOVSlider::FOVManager::GetSingleton()->ScheduleLoadRetry();
+			} else {
+				// Subsequent load in the same session: FOV values are
+				// already correct in runtime. The engine may reset a few
+				// INI settings (fDefaultWorldFOV, fDefault3rdPersonAimFOV)
+				// during the load transition, but the drift watcher will
+				// snap them back within one hot-mode poll cycle. No lerp,
+				// no `fov X Y`, no retry loop needed - this is what was
+				// causing the visible pops on every in-session save load.
+				logger::info("[FOVSlider] kPostLoadGame - subsequent load (session), skipping retry - drift watcher will correct INI");
+				FOVSlider::FOVManager::GetSingleton()->TriggerDriftHotMode(3500);
+			}
 			break;
 
 		case F4SE::MessagingInterface::kPostPostLoad:

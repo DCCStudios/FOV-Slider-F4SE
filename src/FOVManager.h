@@ -282,6 +282,14 @@ namespace FOVSlider
 		// removes the fight.
 		std::atomic<bool> fpInertiaPresent{ false };
 
+		// Set to true after the first ScheduleLoadRetry completes Phase 1.
+		// Subsequent kPostLoadGame events (same session) skip the full retry
+		// sequence: FOV settings are already correct in runtime and the drift
+		// watcher handles any INI values the engine resets during load.
+		// Reset to false on kNewGame so a brand-new session always gets the
+		// full initial apply.
+		std::atomic<bool> initialLoadApplied{ false };
+
 	private:
 
 		// ---- State ----

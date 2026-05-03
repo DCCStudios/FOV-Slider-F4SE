@@ -1160,6 +1160,12 @@ namespace FOVSlider
 		std::thread([this]() {
 			auto* s = Settings::GetSingleton();
 
+			// Mark that the initial apply has started. Subsequent
+			// kPostLoadGame events in the same session will see this
+			// flag and skip the full retry sequence (drift watcher
+			// maintains INI from that point on).
+			initialLoadApplied.store(true);
+
 			// ---- PHASE 1: smooth load-lerp ----
 			// When FPInertia is present, skip the final `fov X Y` + FSRF
 			// in Phase 1. FPInertia already calls RefreshDefaults and runs
