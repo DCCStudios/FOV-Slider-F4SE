@@ -166,13 +166,12 @@ namespace FOVSlider
 		//      PlayerCamera::firstPersonFOV until `fov X Y` re-decouples
 		//      them), which the user perceives as WBFOV being stomped.
 		//
-		// Skip only while FP's WBFOV layer is issuing `fov X Y` +
-		// undo for the current weapon. If FPInertia is loaded but WBFOV
-		// is off (or there's no weapon entry), we ARE the runtime owner.
+		// Skip while FPInertia is present so its WBFOV/camera choreography
+		// is not overwritten by our PlayerCamera writes.
 		auto* mgr = FOVManager::GetSingleton();
-		if (mgr->fpInertiaPresent.load() && mgr->fpInertiaWBFOVMActive.load()) {
+		if (mgr->fpInertiaPresent.load()) {
 			if (Settings::GetSingleton()->logEveryEngineWrite.load()) {
-				logger::trace("[FOVSlider] [{}] WriteRuntimeCameraFOV skipped (FP WBFOV owns runtime/viewmodel)",
+				logger::trace("[FOVSlider] [{}] WriteRuntimeCameraFOV skipped (FPInertia present)",
 					a_caller);
 			}
 			return false;
@@ -566,16 +565,13 @@ namespace FOVSlider
 			// will eventually see, but the runtime field is the more
 			// directly visible one.
 			//
-			// NOTE: when FPInertia WBFOV is actively applying per-weapon `fov X Y`,
-			// runtime drift on PlayerCamera::firstPersonFOV is EXPECTED (~1.5 s)
-			// while FP fixes it. We skip runtime reads whenever
-			// fpInertiaPresent && fpInertiaWBFOVMActive. If FP is loaded but
-			// no weapon WBFOV entry is active (FSVO inactive), WE own runtime
-			// again via SmoothCorrectRuntimeFOV.
+			// NOTE: when FPInertia is present it may oscillate runtime
+			// firstPersonFOV while applying per-weapon `fov X Y`. Skip runtime
+			// drift reads in that case; INI/engine saved values remain useful.
 			float eFov     = 0.0f;
 			float runFov   = 0.0f;
 			float runThird = 0.0f;
-			const bool deferFPRuntime = fpInertiaPresent.load() && fpInertiaWBFOVMActive.load();
+			const bool deferFPRuntime = fpInertiaPresent.load();
 			const bool haveIni = TryReadEngineFloatSetting("fDefault1stPersonFOV:Display", eFov);
 			const bool haveRun = !deferFPRuntime && ReadRuntimeCameraFOV(runFov, runThird);
 			if (!haveIni && !haveRun) continue;
@@ -902,7 +898,7 @@ namespace FOVSlider
 		ApplyFirstPersonFOV(Settings::GetSingleton()->firstPersonFOV.load());
 		ApplyThirdPersonFOV(Settings::GetSingleton()->thirdPersonFOV.load());
 
-		const bool deferVm = fpInertiaPresent.load() && fpInertiaWBFOVMActive.load();
+		const bool deferVm = fpInertiaPresent.load();
 		if (!deferVm && context.load() == FOVContext::Default) {
 			ApplyViewmodelFOV(v);
 		}
@@ -1162,12 +1158,9 @@ namespace FOVSlider
 			initialLoadApplied.store(true);
 
 			// ---- PHASE 1: smooth load-lerp ----
-			// When FP WBFOV owns the weapon's viewmodel, skip our final
-			// `fov X Y`; FP schedules LoadRetry. When FP is absent or WBFOV
-			// is inactive (disabled / no weapon entry), we MUST apply VM
-			// after Phase 1's camera settle — we're the authority.
-			const bool includeVm =
-				!(fpInertiaPresent.load() && fpInertiaWBFOVMActive.load());
+			// When FPInertia is loaded, defer the load-lerp viewmodel apply;
+			// FP coordinates VM through its hooks. Without FP we're sole owner.
+			const bool includeVm = !fpInertiaPresent.load();
 			LerpAllSettings(
 				std::max(50, s->loadBurstDurationMs.load()),
 				std::max(1, s->loadBurstStepMs.load()),

@@ -47,34 +47,6 @@ namespace
 			verbose ? "bVerboseLogging=true" : "bVerboseLogging=false");
 	}
 
-	// FPInertia -> FOV Slider: per-weapon WBFOV layer is actively issuing
-	// `fov X Y` (payload byte 1 = yes, 0 = no — we own baseline viewmodel).
-	// Little-endian dword 'FSVO'.
-	static constexpr std::uint32_t kFPInertia_FSVO_WbfovActive =
-		(static_cast<std::uint32_t>('F')) |
-		(static_cast<std::uint32_t>('S') << 8u) |
-		(static_cast<std::uint32_t>('V') << 16u) |
-		(static_cast<std::uint32_t>('O') << 24u);
-
-	void IncomingFromFPInertia(F4SE::MessagingInterface::Message* msg)
-	{
-		if (!msg) return;
-
-		if (msg->type != kFPInertia_FSVO_WbfovActive) return;
-
-		const bool wbfovActive =
-			(msg->dataLen >= 1u && msg->data != nullptr) &&
-			(*static_cast<const std::uint8_t*>(msg->data) != 0);
-
-		auto* mgr = FOVSlider::FOVManager::GetSingleton();
-		const bool prev = mgr->fpInertiaWBFOVMActive.exchange(wbfovActive);
-
-		if (prev != wbfovActive) {
-			logger::info("[FOVSlider] FSVO from FPInertia: WBFOV actively owning viewmodel = {}",
-				wbfovActive ? "yes" : "no");
-		}
-	}
-
 	// ============================================================
 	// F4SE messaging callback
 	// ============================================================
@@ -136,11 +108,9 @@ namespace
 		{
 			auto* mgr = FOVSlider::FOVManager::GetSingleton();
 
-			mgr->fpInertiaWBFOVMActive.store(false);
-
 			// Other plugins are now loaded - safe to log dependency status.
 			if (auto info = F4SE::GetPluginInfo("FPInertia"); info.has_value()) {
-				logger::info("[FOVSlider] FPInertia v{} detected — WBFOV viewmodel handshake via FSVO (runtime ownership only while a weapon entry applies)",
+				logger::info("[FOVSlider] FPInertia v{} detected — coordinating camera/vm applies on load transitions",
 					info->version);
 				mgr->fpInertiaPresent.store(true);
 			} else {
@@ -191,9 +161,6 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* a_f
 	if (!messaging || !messaging->RegisterListener(MessageCallback)) {
 		logger::critical("[FOVSlider] Failed to register messaging listener");
 		return false;
-	}
-	if (!messaging->RegisterListener(IncomingFromFPInertia, "FPInertia")) {
-		logger::warn("[FOVSlider] Failed to register FPInertia FSVO listener — WBFOV runtime ownership handshake disabled");
 	}
 
 	logger::info("[FOVSlider] Plugin loaded; waiting for kGameDataReady");

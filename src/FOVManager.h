@@ -260,13 +260,6 @@ namespace FOVSlider
 		// Set by main.cpp once kPostPostLoad resolves the plugin list.
 		std::atomic<bool> fpInertiaPresent{ false };
 
-		// True while FPInertia's WBFOV layer actively drives viewmodel `fov X Y`
-		// (WBFOV enabled + equipped weapon has a JSON entry + no FSLK lock).
-		// Received via FSVO cross-plugin messages. When FPInertia is loaded but
-		// this is false — WBFOV off or no weapon entry — this plugin is the
-		// viewmodel authority: apply camera defaults first, then `fov X Y`.
-		std::atomic<bool> fpInertiaWBFOVMActive{ false };
-
 		// Set to true after the first ScheduleLoadRetry completes Phase 1.
 		// Subsequent kPostLoadGame events (same session) skip the full retry
 		// sequence: FOV settings are already correct in runtime and the drift
