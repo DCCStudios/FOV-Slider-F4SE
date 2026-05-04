@@ -257,30 +257,15 @@ namespace FOVSlider
 		void ScheduleFPInertiaUnlock(int ms);
 
 	public:
-		// Set by main.cpp once kPostPostLoad has resolved the plugin
-		// list. When true, FPInertia is the authoritative owner of the
-		// runtime PlayerCamera fields (firstPersonFOV / worldFOV) and
-		// of the viewmodel projection: it issues `fov X Y` for WBFOV,
-		// it does the post-fov runtime undo. Our plugin's role
-		// shrinks to maintaining the INI source-of-truth (so
-		// camera-mode transitions and save loads pick up the right
-		// value) and notifying FPInertia of setting changes.
-		//
-		// Why a hard split: the engine quirk in `fov X Y` clobbers
-		// PlayerCamera::firstPersonFOV and worldFOV to the X arg
-		// (viewmodel). FPInertia issues `fov X Y` on a periodic
-		// timedReapply (~1.5 s) to keep WBFOV alive. If WE also
-		// write the runtime camera fields (B3), we either:
-		//   - fight FPInertia's intended camera state and clobber
-		//     it back to OUR saved value, or
-		//   - drag the viewmodel projection along with our world
-		//     camera write, which the user perceives as "WBFOV
-		//     value being stomped".
-		// Either way both plugins fight, the user sees a 250 ms
-		// lerp ramp every 1.5 s and the viewmodel size flickers.
-		// Letting FPInertia own runtime + viewmodel completely
-		// removes the fight.
+		// Set by main.cpp once kPostPostLoad resolves the plugin list.
 		std::atomic<bool> fpInertiaPresent{ false };
+
+		// True while FPInertia's WBFOV layer actively drives viewmodel `fov X Y`
+		// (WBFOV enabled + equipped weapon has a JSON entry + no FSLK lock).
+		// Received via FSVO cross-plugin messages. When FPInertia is loaded but
+		// this is false — WBFOV off or no weapon entry — this plugin is the
+		// viewmodel authority: apply camera defaults first, then `fov X Y`.
+		std::atomic<bool> fpInertiaWBFOVMActive{ false };
 
 		// Set to true after the first ScheduleLoadRetry completes Phase 1.
 		// Subsequent kPostLoadGame events (same session) skip the full retry

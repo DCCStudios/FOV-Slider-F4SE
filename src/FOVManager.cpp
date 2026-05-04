@@ -166,12 +166,14 @@ namespace FOVSlider
 		//      PlayerCamera::firstPersonFOV until `fov X Y` re-decouples
 		//      them), which the user perceives as WBFOV being stomped.
 		//
-		// So when FPInertia is loaded, all our runtime writes are
-		// no-ops. The drift watcher still flags drift to the log
-		// (visibility) but auto-correct is also a no-op.
-		if (FOVManager::GetSingleton()->fpInertiaPresent.load()) {
+		// Skip only while FP's WBFOV layer is issuing `fov X Y` +
+		// undo for the current weapon. If FPInertia is loaded but WBFOV
+		// is off (or there's no weapon entry), we ARE the runtime owner.
+		auto* mgr = FOVManager::GetSingleton();
+		if (mgr->fpInertiaPresent.load() && mgr->fpInertiaWBFOVMActive.load()) {
 			if (Settings::GetSingleton()->logEveryEngineWrite.load()) {
-				logger::trace("[FOVSlider] [{}] WriteRuntimeCameraFOV skipped (FPInertia owns runtime)", a_caller);
+				logger::trace("[FOVSlider] [{}] WriteRuntimeCameraFOV skipped (FP WBFOV owns runtime/viewmodel)",
+					a_caller);
 			}
 			return false;
 		}
@@ -564,21 +566,18 @@ namespace FOVSlider
 			// will eventually see, but the runtime field is the more
 			// directly visible one.
 			//
-			// NOTE: when FPInertia is loaded, runtime drift is EXPECTED
-			// every ~1.5 s (FPInertia's timedReapply issues `fov X Y`
-			// for WBFOV, which clobbers PlayerCamera::firstPersonFOV
-			// to the X arg). FPInertia owns the runtime undo in that
-			// case. We still want INI drift detection (engine restore
-			// on save load can still hit the INI path), so we read
-			// INI either way - we just skip the runtime read when
-			// FPInertia is present, so the watcher only flags REAL
-			// problems (INI drift, which only the engine causes).
+			// NOTE: when FPInertia WBFOV is actively applying per-weapon `fov X Y`,
+			// runtime drift on PlayerCamera::firstPersonFOV is EXPECTED (~1.5 s)
+			// while FP fixes it. We skip runtime reads whenever
+			// fpInertiaPresent && fpInertiaWBFOVMActive. If FP is loaded but
+			// no weapon WBFOV entry is active (FSVO inactive), WE own runtime
+			// again via SmoothCorrectRuntimeFOV.
 			float eFov     = 0.0f;
 			float runFov   = 0.0f;
 			float runThird = 0.0f;
-			const bool fpiPresent = fpInertiaPresent.load();
+			const bool deferFPRuntime = fpInertiaPresent.load() && fpInertiaWBFOVMActive.load();
 			const bool haveIni = TryReadEngineFloatSetting("fDefault1stPersonFOV:Display", eFov);
-			const bool haveRun = !fpiPresent && ReadRuntimeCameraFOV(runFov, runThird);
+			const bool haveRun = !deferFPRuntime && ReadRuntimeCameraFOV(runFov, runThird);
 			if (!haveIni && !haveRun) continue;
 
 			const float saved = Settings::GetSingleton()->firstPersonFOV.load();
@@ -613,15 +612,10 @@ namespace FOVSlider
 				if (settings->driftAutoCorrect.load()) {
 					const int durMs = std::max(50,
 						settings->driftCorrectDurationMs.load());
-					if (fpiPresent) {
-						// FPInertia present: only the INI source-of-truth
-						// is ours to fix. Runtime PlayerCamera fields are
-						// FPInertia's responsibility (post-`fov X Y`
-						// undo). A snap INI write is enough - the engine
-						// re-reads INI on the next camera-mode transition,
-						// and FPInertia's next `fov X Y` will pick up the
-						// corrected Y arg from our INI.
-						logger::warn("[FOVSlider] DRIFT auto-correct (INI-only, FPInertia owns runtime): {:.2f} -> {:.2f}",
+					if (deferFPRuntime) {
+						// FP WBFOV path: runtime post-fov undo is theirs.
+						// Correct INI; their next apply picks up camera Y.
+						logger::warn("[FOVSlider] DRIFT auto-correct (INI-only, FP WBFOV owns runtime): {:.2f} -> {:.2f}",
 							reportedEngine, saved);
 						SetEngineFloatSetting("fDefault1stPersonFOV:Display", saved, "DriftAutoCorrect");
 						SetEngineFloatSetting("fDefaultWorldFOV:Display",
@@ -902,15 +896,16 @@ namespace FOVSlider
 		Settings::GetSingleton()->viewmodelFOV.store(v);
 		Settings::GetSingleton()->Save();
 
-		// Re-applying the viewmodel FOV resets both 1st- and 3rd-person
-		// camera FOVs (engine quirk of `fov X` vs `fov X Y`), so we set
-		// them back immediately afterward.
-		if (context.load() == FOVContext::Default) {
-			ApplyViewmodelFOV(v);
-		}
-		// Always re-assert camera FOVs so the engine quirk doesn't bite us.
+		// Camera defaults first (`fov X Y` always clobbers runtime — we fix
+		// afterward). When FP's WBFOV is driving the weapon, omit our own
+		// vm apply; FSRF makes FP reload this default instead.
 		ApplyFirstPersonFOV(Settings::GetSingleton()->firstPersonFOV.load());
 		ApplyThirdPersonFOV(Settings::GetSingleton()->thirdPersonFOV.load());
+
+		const bool deferVm = fpInertiaPresent.load() && fpInertiaWBFOVMActive.load();
+		if (!deferVm && context.load() == FOVContext::Default) {
+			ApplyViewmodelFOV(v);
+		}
 
 		NotifyFPInertia();
 	}
@@ -1167,14 +1162,12 @@ namespace FOVSlider
 			initialLoadApplied.store(true);
 
 			// ---- PHASE 1: smooth load-lerp ----
-			// When FPInertia is present, skip the final `fov X Y` + FSRF
-			// in Phase 1. FPInertia already calls RefreshDefaults and runs
-			// its own LoadRetryBurst on kPostLoadGame, so it handles the
-			// viewmodel apply itself. Our `fov X Y` would clobber
-			// PlayerCamera::firstPersonFOV to the viewmodel value (engine
-			// quirk) AFTER the loading screen closes, causing a visible
-			// camera-FOV pop to the viewmodel value for every in-game load.
-			const bool includeVm = !fpInertiaPresent.load();
+			// When FP WBFOV owns the weapon's viewmodel, skip our final
+			// `fov X Y`; FP schedules LoadRetry. When FP is absent or WBFOV
+			// is inactive (disabled / no weapon entry), we MUST apply VM
+			// after Phase 1's camera settle — we're the authority.
+			const bool includeVm =
+				!(fpInertiaPresent.load() && fpInertiaWBFOVMActive.load());
 			LerpAllSettings(
 				std::max(50, s->loadBurstDurationMs.load()),
 				std::max(1, s->loadBurstStepMs.load()),
@@ -1255,6 +1248,10 @@ namespace FOVSlider
 		// Lock FIRST so FPInertia stops applying before our lerp begins.
 		NotifyFPInertiaLock(true);
 
+		// Establish camera baseline before adjusting viewmodel projection.
+		ApplyFirstPersonFOV(s->firstPersonFOV.load());
+		ApplyThirdPersonFOV(s->thirdPersonFOV.load());
+
 		InterpolateViewmodelFOV(fromVm, toVm, s->interpFramesFast.load());
 
 		// Re-assert 3rd-person FOV in case anything reset it.
@@ -1284,6 +1281,10 @@ namespace FOVSlider
 		std::lock_guard lock(transitionMtx);
 		context.store(FOVContext::Default);
 
+		// Resolve camera defaults before viewmodel interpolate.
+		ApplyFirstPersonFOV(s->firstPersonFOV.load());
+		ApplyThirdPersonFOV(s->thirdPersonFOV.load());
+
 		InterpolateViewmodelFOV(fromVm, toVm, s->interpFrames.load());
 
 		// On close, the engine sometimes momentarily resets the camera
@@ -1310,6 +1311,9 @@ namespace FOVSlider
 		context.store(FOVContext::Terminal);
 		NotifyFPInertiaLock(true);
 
+		ApplyFirstPersonFOV(s->firstPersonFOV.load());
+		ApplyThirdPersonFOV(s->thirdPersonFOV.load());
+
 		const float fromVm = s->viewmodelFOV.load();
 		const float toVm   = s->terminalFOV.load();
 		InterpolateViewmodelFOV(fromVm, toVm, s->interpFrames.load());
@@ -1323,6 +1327,9 @@ namespace FOVSlider
 
 		std::lock_guard lock(transitionMtx);
 		context.store(FOVContext::Default);
+
+		ApplyFirstPersonFOV(s->firstPersonFOV.load());
+		ApplyThirdPersonFOV(s->thirdPersonFOV.load());
 
 		const float fromVm = s->terminalFOV.load();
 		const float toVm   = s->viewmodelFOV.load();
