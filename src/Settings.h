@@ -129,14 +129,23 @@ namespace FOVSlider
 		// shifting.
 		std::atomic<int> driftCorrectDurationMs{ 250 };
 
+		// When true (default), Save() mirrors camera-related defaults into the
+		// game's Fallout4Custom.ini ([Display]/[Camera]) so cold boot /
+		// early engine init agrees with slider values instead of drifting.
+		std::atomic<bool> syncFallout4CustomIni{ true };
+
 		// ---- IO ----
 		// Returns the resolved INI path (next to the DLL).
 		std::filesystem::path GetIniPath() const;
 
+		// Documents\My Games\Fallout4\Fallout4Custom.ini (empty if unresolved).
+		static std::filesystem::path ResolveFallout4CustomIniPath();
+
 		// Load from INI; missing file => write defaults.
 		bool Load();
 
-		// Save current atomic state back to INI.
+		// Save current atomic state back to plugin INI. When
+		// syncFallout4CustomIni is set, also updates Fallout4Custom.ini.
 		bool Save();
 
 	private:

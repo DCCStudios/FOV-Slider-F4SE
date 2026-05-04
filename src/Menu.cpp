@@ -104,6 +104,14 @@ namespace FOVSlider::Menu
 		     fov->GetContext() == FOVContext::Terminal ? "Terminal" :
 		     fov->GetContext() == FOVContext::Aiming   ? "Aiming"   : "?");
 
+		TextWrapped("Saving also updates your game's Fallout4Custom.ini (Documents\\My Games\\Fallout4) with "
+		            "[Display] fDefault1stPersonFOV, fDefaultWorldFOV, and fNearDistance, plus "
+		            "[Camera] f3rdPersonAimFOV, so bootstrap engine defaults match First-Person FOV, "
+		            "Third-Person FOV, Camera Near Distance, and Third-Person Aim FOV. That avoids pops "
+		            "when those values drifted from this plugin INI.");
+		TextWrapped(
+			"Viewmodel/Pip-Boy/Terminal FOV stay in this plugin only (runtime console); flip [INI] bSyncFallout4CustomIni in FOV Slider F4SE.ini or uncheck below to skip merging Fallout4Custom.ini.");
+
 		// Debug popout toggle. Reads/writes the framework-owned
 		// IsOpen flag directly so the checkbox stays in sync if the
 		// user closes the window via its own Close button (or any
@@ -118,6 +126,17 @@ namespace FOVSlider::Menu
 				           "values, current context, camera state, and\n"
 				           "FPInertia status. Stays visible during gameplay.");
 			}
+		}
+
+		bool syncFo4Custom = Settings::GetSingleton()->syncFallout4CustomIni.load();
+		if (Checkbox("Merge camera defaults into Fallout4Custom.ini on save##fovslider_mergefo4", &syncFo4Custom)) {
+			Settings::GetSingleton()->syncFallout4CustomIni.store(syncFo4Custom);
+			Settings::GetSingleton()->Save();
+		}
+		if (IsItemHovered()) {
+			SetTooltip("When enabled, each Save writes [Display]/[Camera] FOV baseline keys "
+			           "to the real fallout4custom.ini next to Bethesda's launcher path.\n"
+			           "Turn off only if BethINI or another mod exclusively owns those lines.");
 		}
 
 		// Verbose-logging toggle. Mirrors [Diagnostics] bVerboseLogging
@@ -210,10 +229,9 @@ namespace FOVSlider::Menu
 			Settings::GetSingleton()->Save();
 		}
 		if (IsItemHovered()) {
-			SetTooltip("Writes the current settings to FOV Slider F4SE.ini.\n"
-			           "Settings are also auto-saved whenever you move a\n"
-			           "slider, but this lets you commit a set of changes\n"
-			           "all at once.");
+			SetTooltip("Writes FOV Slider F4SE.ini plus (unless disabled) merges First-/Third-person world FOV,\n"
+			           "near distance, and 3rd-person aim FOV into Documents\\My Games\\Fallout4\\Fallout4Custom.ini\n"
+			           "so bootstrap defaults match sliders. Slide changes already Save automatically.");
 		}
 		SameLine();
 		if (Button("Re-apply All")) {

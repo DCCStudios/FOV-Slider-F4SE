@@ -1,12 +1,86 @@
 #include "PCH.h"
 #include "Settings.h"
 
+#pragma comment(lib, "Shell32.lib")
+#pragma comment(lib, "Ole32.lib")
+
+#include <KnownFolders.h>
+#include <ShlObj.h>
+
 namespace FOVSlider
 {
 	static constexpr const char* kSection_Display     = "Display";
 	static constexpr const char* kSection_Interp      = "Interpolation";
 	static constexpr const char* kSection_GameLoad    = "GameLoad";
 	static constexpr const char* kSection_Diagnostics = "Diagnostics";
+	static constexpr const char* kSection_INI        = "INI";
+
+	// Bethesda's Fallout4Custom.ini sections (persisted baseline the engine reads).
+	static constexpr const char* kFo4_Display = "Display";
+	static constexpr const char* kFo4_Camera  = "Camera";
+
+	std::filesystem::path Settings::ResolveFallout4CustomIniPath()
+	{
+		PWSTR docs = nullptr;
+		const HRESULT hr = SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs);
+		if (FAILED(hr) || !docs) {
+			return {};
+		}
+		std::filesystem::path p(docs);
+		CoTaskMemFree(docs);
+		return p / "My Games" / "Fallout4" / "Fallout4Custom.ini";
+	}
+
+	static bool SyncFallout4CustomIniFile(Settings* self)
+	{
+		if (!self->syncFallout4CustomIni.load()) {
+			return true;
+		}
+
+		const auto customPath = Settings::ResolveFallout4CustomIniPath();
+		if (customPath.empty()) {
+			logger::warn("[FOVSlider] Could not resolve Documents path; Fallout4Custom.ini was not synced");
+			return false;
+		}
+
+		std::error_code ec;
+		std::filesystem::create_directories(customPath.parent_path(), ec);
+
+		CSimpleIniA fo4Ini;
+		fo4Ini.SetUnicode();
+
+		if (std::filesystem::exists(customPath)) {
+			const SI_Error lrc = fo4Ini.LoadFile(customPath.string().c_str());
+			if (lrc < 0) {
+				logger::warn("[FOVSlider] Failed to parse '{}'; refusing to overwrite Fallout4Custom.ini sync",
+					customPath.string());
+				return false;
+			}
+		}
+
+		// Match engine `:Display` keys we drive at runtime (`FOVManager::Apply*`).
+		fo4Ini.SetDoubleValue(kFo4_Display, "fDefault1stPersonFOV",
+			static_cast<double>(self->firstPersonFOV.load()));
+		fo4Ini.SetDoubleValue(kFo4_Display, "fDefaultWorldFOV",
+			static_cast<double>(self->thirdPersonFOV.load()));
+		fo4Ini.SetDoubleValue(kFo4_Display, "fNearDistance",
+			static_cast<double>(self->cameraDistance.load()));
+
+		// Third-person irons - engine collection key `f3rdPersonAimFOV:Camera`.
+		fo4Ini.SetDoubleValue(kFo4_Camera, "f3rdPersonAimFOV",
+			static_cast<double>(self->thirdPersonAimFOV.load()));
+
+		const SI_Error wrc = fo4Ini.SaveFile(customPath.string().c_str());
+		if (wrc < 0) {
+			logger::error("[FOVSlider] Failed to write Fallout4Custom.ini at '{}'",
+				customPath.string());
+			return false;
+		}
+
+		logger::info("[FOVSlider] Updated Fallout4Custom.ini '{}' (camera defaults synced with sliders)",
+			customPath.string());
+		return true;
+	}
 
 	std::filesystem::path Settings::GetIniPath() const
 	{
@@ -75,6 +149,9 @@ namespace FOVSlider
 		driftWatchHotDurationMs.store( getI(kSection_Diagnostics, "iDriftWatchHotDurationMs", 3500));
 		driftAutoCorrect.store(        getB(kSection_Diagnostics, "bDriftAutoCorrect",       true));
 		driftCorrectDurationMs.store(  getI(kSection_Diagnostics, "iDriftCorrectDurationMs", 250));
+
+		syncFallout4CustomIni.store(
+			getB(kSection_INI, "bSyncFallout4CustomIni", true));
 
 		// ---- Migrate stale aggressive values from earlier dev iterations ----
 		// Prior versions of this plugin shipped with iDriftCorrectDurationMs=50
@@ -173,12 +250,16 @@ namespace FOVSlider
 		setB(kSection_Diagnostics, "bDriftAutoCorrect",          driftAutoCorrect.load());
 		setI(kSection_Diagnostics, "iDriftCorrectDurationMs",    driftCorrectDurationMs.load());
 
+		setB(kSection_INI, "bSyncFallout4CustomIni", syncFallout4CustomIni.load());
+
 		const SI_Error rc = ini.SaveFile(path.string().c_str());
 		if (rc < 0) {
 			logger::error("[FOVSlider] Failed to save '{}'", path.string());
 			return false;
 		}
 		logger::trace("[FOVSlider] Saved settings to '{}'", path.string());
+
+		(void)SyncFallout4CustomIniFile(this);
 		return true;
 	}
 }
