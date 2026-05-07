@@ -7,7 +7,7 @@
 namespace FOVSlider
 {
 	// ============================================================
-	// MenuSink - PipBoy / Terminal open/close
+	// MenuSink - PipBoy / VATS / Terminal open/close
 	// ============================================================
 	void MenuSink::Register()
 	{
@@ -32,14 +32,15 @@ namespace FOVSlider
 
 		// BSFixedString interns; compare to interned constants.
 		static const RE::BSFixedString kPipBoy      = "PipboyMenu";
+		static const RE::BSFixedString kVATSMenu   = "VATSMenu";
 		static const RE::BSFixedString kTerminal    = "TerminalMenu";
 		static const RE::BSFixedString kLoading     = "LoadingMenu";
 		static const RE::BSFixedString kFader       = "FaderMenu";
 		static const RE::BSFixedString kExamine     = "ExamineMenu";
 
 		// Trace EVERY menu event so we can see what fires around any
-		// reported FOV drift. Most are ignored (we only act on PipBoy
-		// and TerminalMenu) but the user-facing diagnostics need to
+		// reported FOV drift. Most are ignored (we only act on PipBoy,
+		// VATS, and TerminalMenu) but the user-facing diagnostics need to
 		// show what we DID see.
 		logger::trace("[FOVSlider] MenuOpenCloseEvent name='{}' opening={}",
 			name.c_str() ? name.c_str() : "(null)", open);
@@ -52,6 +53,12 @@ namespace FOVSlider
 				fov->OnPipBoyOpening();
 			} else {
 				fov->OnPipBoyClosing();
+			}
+		} else if (name == kVATSMenu) {
+			if (open) {
+				fov->OnVATSBegin();
+			} else {
+				fov->OnVATSEnd();
 			}
 		} else if (name == kTerminal) {
 			// TerminalMenu close is a reliable signal. The OPEN side is
@@ -210,6 +217,7 @@ namespace FOVSlider
 				hadTerm ? "yes" : "no",
 				fov->GetContext() == FOVContext::Terminal ? "Terminal" :
 				fov->GetContext() == FOVContext::PipBoy   ? "PipBoy"   :
+				fov->GetContext() == FOVContext::VATS     ? "VATS"     :
 				fov->GetContext() == FOVContext::Aiming   ? "Aiming"   : "Default");
 			fov->LogEngineSnapshot("CameraOverrideEnd");
 

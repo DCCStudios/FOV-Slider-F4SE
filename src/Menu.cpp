@@ -98,11 +98,34 @@ namespace FOVSlider::Menu
 		Text("FOV Slider F4SE");
 		TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
 		            "F4SE plugin replacement for Simple FOV Slider");
+
+		{
+			auto* s = Settings::GetSingleton();
+			bool    master = s->pluginEnabled.load();
+			if (CheckboxTooltip("Enable FOV Slider plugin##fovslider_master", &master,
+			                    "Master switch. When off, no camera or viewmodel writes, no load\n"
+			                    "burst, no drift correction, and no Pip-Boy/terminal/ADS FOV changes.\n"
+			                    "Your slider values are still saved; toggle on to apply them again.\n"
+			                    "[Plugin] bEnablePlugin in FOV Slider F4SE.ini.")) {
+				const bool turningOff = s->pluginEnabled.load() && !master;
+				s->pluginEnabled.store(master);
+				s->Save();
+				if (turningOff) {
+					fov->ReleaseFPExternalLock();
+					logger::info("[FOVSlider] Master disable — released FPInertia FSLK lock (if held)");
+				} else if (master) {
+					fov->ApplyAllSettings();
+					logger::info("[FOVSlider] Master enable — applied all settings");
+				}
+			}
+		}
+
 		Text("Active context: %s",
 		     fov->GetContext() == FOVContext::Default  ? "Default" :
 		     fov->GetContext() == FOVContext::PipBoy   ? "Pip-Boy"  :
 		     fov->GetContext() == FOVContext::Terminal ? "Terminal" :
-		     fov->GetContext() == FOVContext::Aiming   ? "Aiming"   : "?");
+		     fov->GetContext() == FOVContext::Aiming   ? "Aiming"   :
+		     fov->GetContext() == FOVContext::VATS     ? "VATS"     : "?");
 
 		TextWrapped("Saving also updates your game's Fallout4Custom.ini (Documents\\My Games\\Fallout4) with "
 		            "[Display] fDefault1stPersonFOV, fDefaultWorldFOV, and fNearDistance, plus "
@@ -282,6 +305,7 @@ namespace FOVSlider::Menu
 				case FOVContext::PipBoy:   return "Pip-Boy";
 				case FOVContext::Terminal: return "Terminal";
 				case FOVContext::Aiming:   return "Aiming";
+				case FOVContext::VATS:     return "VATS";
 				default:                   return "?";
 			}
 		}
@@ -346,6 +370,7 @@ namespace FOVSlider::Menu
 			TextColored(ImVec4(0.6f, 0.85f, 1.0f, 1.0f), "State");
 			Spacing();
 			Text("Context:       %s", ContextLabel(ctx));
+			Text("Plugin apply: %s", settings->pluginEnabled.load() ? "ENABLED" : "disabled (INI only)");
 			Text("Camera state:  %s", cameraState == static_cast<unsigned>(-1)
 				? "(unavailable)" : CameraStateLabel(cameraState));
 			Text("Power Armor:   %s", inPA  ? "yes" : "no");

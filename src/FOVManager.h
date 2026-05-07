@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 namespace FOVSlider
@@ -16,7 +17,8 @@ namespace FOVSlider
 		Default = 0,    // ordinary gameplay - viewmodel = ViewmodelFOV (or WBFOV override from FPInertia)
 		PipBoy,         // PipBoy menu open
 		Terminal,       // Terminal furniture / camera override active
-		Aiming          // First-person ADS (sightedStateEnter)
+		Aiming,         // First-person ADS (sightedStateEnter)
+		VATS            // VATS menu / VATS camera — engine owns FOV until exit
 	};
 
 	class FOVManager
@@ -68,7 +70,10 @@ namespace FOVSlider
 		//
 		// Cancels any in-flight lerp via the interpGeneration counter.
 		// Spawns a detached worker thread; returns immediately.
-		void LerpAllSettings(int durationMs, int stepMs = 8, bool a_includeViewmodel = true);
+		// Optional overrides: used when lerping back to ADS aim FOV after VATS.
+		void LerpAllSettings(int durationMs, int stepMs = 8, bool a_includeViewmodel = true,
+			std::optional<float> a_firstPersonTarget = std::nullopt,
+			std::optional<float> a_thirdPersonTarget = std::nullopt);
 
 		// Schedule a deferred re-apply of all settings to defeat the
 		// engine's late camera initialization on game load. Spawns a
@@ -112,6 +117,14 @@ namespace FOVSlider
 		void OnTerminalExited();     // OnGetUp from terminal
 		void OnSightedStateEnter();
 		void OnSightedStateExit();
+
+		// VATSMenu open/close — defer our applies while VATS runs, then lerp back.
+		void OnVATSBegin();
+		void OnVATSEnd();
+
+		// Releases FPInertia external lock — call when disabling the plugin
+		// mid-session (Pip-Boy / aiming may have locked WBFOV applies).
+		void ReleaseFPExternalLock();
 
 		// ---- Queries ----
 		FOVContext GetContext() const { return context.load(); }

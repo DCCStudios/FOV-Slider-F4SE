@@ -18,6 +18,10 @@ namespace FOVSlider
 			return &s;
 		}
 
+		// When false: no applies, lerps, drift correction, Pip-Boy/terminal/ADS
+		// FOV choreography, or Fallout4Custom.ini sync — values are stored only.
+		std::atomic<bool> pluginEnabled{ true };
+
 		// ---- Display values (degrees) ----
 		std::atomic<float> firstPersonFOV{ 80.0f };
 		std::atomic<float> thirdPersonFOV{ 80.0f };

@@ -9,6 +9,7 @@
 
 namespace FOVSlider
 {
+	static constexpr const char* kSection_Plugin      = "Plugin";
 	static constexpr const char* kSection_Display     = "Display";
 	static constexpr const char* kSection_Interp      = "Interpolation";
 	static constexpr const char* kSection_GameLoad    = "GameLoad";
@@ -123,6 +124,8 @@ namespace FOVSlider
 			return ini.GetBoolValue(section, key, def);
 		};
 
+		pluginEnabled.store(getB(kSection_Plugin, "bEnablePlugin", true));
+
 		firstPersonFOV.store(         getF(kSection_Display, "fFirstPersonFOV",          80.0f));
 		thirdPersonFOV.store(         getF(kSection_Display, "fThirdPersonFOV",          80.0f));
 		viewmodelFOV.store(           getF(kSection_Display, "fViewmodelFOV",            80.0f));
@@ -177,6 +180,8 @@ namespace FOVSlider
 		if (!exists) needPersist = true;
 
 		logger::info("[FOVSlider] Loaded settings from '{}'", path.string());
+		logger::info("[FOVSlider]  Master enable (bEnablePlugin) = {}",
+			pluginEnabled.load() ? "true" : "false");
 		logger::info("[FOVSlider]  1stP={:.1f} 3rdP={:.1f} VM={:.1f} PB={:.1f} TM={:.1f} ND={:.2f}",
 			firstPersonFOV.load(), thirdPersonFOV.load(), viewmodelFOV.load(),
 			pipBoyFOV.load(), terminalFOV.load(), cameraDistance.load());
@@ -223,6 +228,8 @@ namespace FOVSlider
 			ini.SetBoolValue(section, key, v);
 		};
 
+		setB(kSection_Plugin, "bEnablePlugin", pluginEnabled.load());
+
 		setF(kSection_Display, "fFirstPersonFOV",          firstPersonFOV.load());
 		setF(kSection_Display, "fThirdPersonFOV",          thirdPersonFOV.load());
 		setF(kSection_Display, "fViewmodelFOV",            viewmodelFOV.load());
@@ -259,7 +266,9 @@ namespace FOVSlider
 		}
 		logger::trace("[FOVSlider] Saved settings to '{}'", path.string());
 
-		(void)SyncFallout4CustomIniFile(this);
+		if (pluginEnabled.load()) {
+			(void)SyncFallout4CustomIniFile(this);
+		}
 		return true;
 	}
 }

@@ -22,8 +22,24 @@ namespace FOVSlider
 			case FOVContext::PipBoy:   return "PipBoy";
 			case FOVContext::Terminal: return "Terminal";
 			case FOVContext::Aiming:   return "Aiming";
+			case FOVContext::VATS:     return "VATS";
 			default:                   return "?";
 		}
+	}
+
+	static bool PluginEffectsEnabled()
+	{
+		return Settings::GetSingleton()->pluginEnabled.load();
+	}
+
+	// VATS (menu + kVATS camera) drives its own FOV — don't fight it.
+	static bool DeferFOVForVATS()
+	{
+		auto* mgr = FOVManager::GetSingleton();
+		if (mgr->GetContext() == FOVContext::VATS) {
+			return true;
+		}
+		return IsPlayerCameraVATS();
 	}
 
 	// ============================================================
@@ -169,6 +185,13 @@ namespace FOVSlider
 		// Skip while FPInertia is present so its WBFOV/camera choreography
 		// is not overwritten by our PlayerCamera writes.
 		auto* mgr = FOVManager::GetSingleton();
+		if (DeferFOVForVATS()) {
+			if (Settings::GetSingleton()->logEveryEngineWrite.load()) {
+				logger::trace("[FOVSlider] [{}] WriteRuntimeCameraFOV skipped (VATS)",
+					a_caller);
+			}
+			return false;
+		}
 		if (mgr->fpInertiaPresent.load()) {
 			if (Settings::GetSingleton()->logEveryEngineWrite.load()) {
 				logger::trace("[FOVSlider] [{}] WriteRuntimeCameraFOV skipped (FPInertia present)",
@@ -240,6 +263,13 @@ namespace FOVSlider
 	// re-trigger the loop).
 	void FOVManager::SmoothCorrectRuntimeFOV(int durationMs, int stepMs)
 	{
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
+		if (DeferFOVForVATS()) {
+			return;
+		}
+
 		const std::uint64_t myGen = ++interpGeneration;
 
 		std::thread([this, myGen, durationMs, stepMs]() {
@@ -438,6 +468,9 @@ namespace FOVSlider
 	// decide they don't want it).
 	void FOVManager::TriggerDriftHotMode(int durationMs)
 	{
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
 		if (durationMs <= 0) return;
 		// Clamp to at least 100 ms so a typo doesn't render the API
 		// useless. Upper bound is open - the cost is one extra atomic
@@ -549,6 +582,10 @@ namespace FOVSlider
 				continue;
 			}
 
+			if (!settings->pluginEnabled.load()) {
+				continue;
+			}
+
 			// Aiming intentionally drives a different camera FOV;
 			// PipBoy / Terminal don't (only the viewmodel is overlaid
 			// in those contexts), so we DO check for camera-FOV drift
@@ -559,93 +596,67 @@ namespace FOVSlider
 				continue;
 			}
 
-			// Read BOTH the INI setting (engine's source-of-truth) and
-			// the PlayerCamera runtime field (what the renderer actually
-			// uses). Either drifting from saved is "real" drift the user
-			// will eventually see, but the runtime field is the more
-			// directly visible one.
-			//
-			// NOTE: when FPInertia is present it may oscillate runtime
-			// firstPersonFOV while applying per-weapon `fov X Y`. Skip runtime
-			// drift reads in that case; INI/engine saved values remain useful.
-			float eFov     = 0.0f;
-			float runFov   = 0.0f;
-			float runThird = 0.0f;
-			const bool deferFPRuntime = fpInertiaPresent.load();
+			if (context.load() == FOVContext::VATS || IsPlayerCameraVATS()) {
+				wasDrifting          = false;
+				lastDriftEngineValue = std::numeric_limits<float>::quiet_NaN();
+				continue;
+			}
+
+			// Compare the INI setting against saved. We intentionally
+			// do NOT read PlayerCamera::firstPersonFOV for drift
+			// detection: in decoupled state (after any `fov X Y`
+			// call) that field holds the VIEWMODEL value, not the
+			// camera value. Comparing it against saved camera FOV
+			// would always show a false delta (e.g. vm=80 vs
+			// saved=105) and trigger an infinite correction loop.
+			float eFov = 0.0f;
 			const bool haveIni = TryReadEngineFloatSetting("fDefault1stPersonFOV:Display", eFov);
-			const bool haveRun = !deferFPRuntime && ReadRuntimeCameraFOV(runFov, runThird);
-			if (!haveIni && !haveRun) continue;
+			if (!haveIni) continue;
 
 			const float saved = Settings::GetSingleton()->firstPersonFOV.load();
-			const float deltaIni = haveIni ? std::fabs(eFov - saved)   : 0.0f;
-			const float deltaRun = haveRun ? std::fabs(runFov - saved) : 0.0f;
-
-			// Whichever is further off-target drives the report (so the
-			// log shows the worse of the two sources).
-			const float delta = std::max(deltaIni, deltaRun);
-			const float reportedEngine = (deltaRun >= deltaIni && haveRun) ? runFov : eFov;
-			const char* source         = (deltaRun >= deltaIni && haveRun) ? "runtime" : "INI";
+			const float delta = std::fabs(eFov - saved);
+			const float reportedEngine = eFov;
+			const char* source         = "INI";
 
 			if (delta > 0.5f) {
 				const bool sameAsLastReport = std::fabs(reportedEngine - lastDriftEngineValue) < 0.05f;
 				if (!sameAsLastReport) {
-					logger::warn("[FOVSlider] DRIFT detected ({}): 1stPersonFOV saved={:.2f} engine={:.2f} (delta={:.2f}, ini={:.2f} runtime={:.2f})",
-						source, saved, reportedEngine, delta,
-						haveIni ? eFov : 0.0f, haveRun ? runFov : 0.0f);
+					logger::warn("[FOVSlider] DRIFT detected ({}): 1stPersonFOV saved={:.2f} engine={:.2f} (delta={:.2f})",
+						source, saved, reportedEngine, delta);
 					LogEngineSnapshot("DRIFT");
 					lastDriftEngineValue = reportedEngine;
 				}
 				wasDrifting = true;
 
-				// Auto-correct if enabled. We use the SAME smooth lerp
-				// shape as Pip-Boy / iron sights / game-load so the
-				// user sees a brief FOV ease back to the saved value
-				// instead of a snap. The lerp covers 1st- and
-				// 3rd-person FOV; the other settings (3rd-person aim
-				// FOV, near distance) get an instant re-apply at the
-				// start of the lerp because they don't visibly
-				// transition.
 				if (settings->driftAutoCorrect.load()) {
-					const int durMs = std::max(50,
-						settings->driftCorrectDurationMs.load());
-					if (deferFPRuntime) {
-						// FP WBFOV path: runtime post-fov undo is theirs.
-						// Correct INI; their next apply picks up camera Y.
-						logger::warn("[FOVSlider] DRIFT auto-correct (INI-only, FP WBFOV owns runtime): {:.2f} -> {:.2f}",
+					if (fpInertiaPresent.load()) {
+						// FPInertia path: correct both INI settings.
+						// FPInertia's next `fov X Y` picks up camera Y.
+						logger::warn("[FOVSlider] DRIFT auto-correct (INI-only, FPInertia owns runtime): {:.2f} -> {:.2f}",
 							reportedEngine, saved);
 						SetEngineFloatSetting("fDefault1stPersonFOV:Display", saved, "DriftAutoCorrect");
 						SetEngineFloatSetting("fDefaultWorldFOV:Display",
 							Settings::GetSingleton()->thirdPersonFOV.load(),
 							"DriftAutoCorrect");
-						// Short suppress window so we don't double-fire on
-						// the same drift before the engine settles.
 						suppressCycles = 2;
 					} else {
-						logger::warn("[FOVSlider] DRIFT auto-correct: runtime-lerp {:.2f} -> {:.2f} over {} ms",
-							reportedEngine, saved, durMs);
-						// Use SmoothCorrectRuntimeFOV (NOT LerpAllSettings):
-						// runtime-only lerp that does NOT issue `fov X Y`,
-						// does NOT touch INI, and does NOT dispatch FSRF.
-						// Going through the full apply chain here would
-						// create a feedback loop with FPInertia (loop is
-						// also avoided structurally by the fpiPresent
-						// branch above; this path only runs when FPInertia
-						// is absent and we're the sole runtime owner).
-						SmoothCorrectRuntimeFOV(durMs, 8);
-
-						// Suppress polls until the lerp definitely
-						// finishes AND FPInertia has had a tick to read
-						// back the corrected value. ceil(dur / interval)
-						// + 1 = at least one full poll past the lerp end.
-						// Use the CURRENT interval (could be hot or cold)
-						// so the suppress window matches the actual poll
-						// rate.
-						suppressCycles = (durMs + interval - 1) / interval + 1;
+						// No FPInertia: fix INI then re-issue `fov X Y`
+						// to instantly update the camera projection.
+						// We cannot use PlayerCamera::firstPersonFOV
+						// writes because that field is the viewmodel
+						// (set to X by `fov X Y`), not the camera.
+						logger::warn("[FOVSlider] DRIFT auto-correct: INI+fov {:.2f} -> {:.2f}",
+							reportedEngine, saved);
+						SetEngineFloatSetting("fDefault1stPersonFOV:Display", saved, "DriftAutoCorrect");
+						lastAppliedCamera.store(-1.0f);
+						lastAppliedViewmodel.store(-1.0f);
+						ApplyViewmodelFOV(GetTargetViewmodelFOV());
+						suppressCycles = 2;
 					}
 				}
 			} else if (wasDrifting) {
-				logger::info("[FOVSlider] DRIFT cleared: 1stPersonFOV now ini={:.2f} runtime={:.2f} (saved={:.2f})",
-					haveIni ? eFov : 0.0f, haveRun ? runFov : 0.0f, saved);
+				logger::info("[FOVSlider] DRIFT cleared: 1stPersonFOV now ini={:.2f} (saved={:.2f})",
+					eFov, saved);
 				wasDrifting          = false;
 				lastDriftEngineValue = std::numeric_limits<float>::quiet_NaN();
 			}
@@ -657,6 +668,10 @@ namespace FOVSlider
 	// ============================================================
 	void FOVManager::ApplyFirstPersonFOV(float fov)
 	{
+		if (DeferFOVForVATS()) {
+			return;
+		}
+
 		// 1) INI source-of-truth (read by engine on camera-mode
 		//    transitions / save load).
 		SetEngineFloatSetting("fDefault1stPersonFOV:Display", fov, "ApplyFirstPersonFOV");
@@ -682,6 +697,10 @@ namespace FOVSlider
 
 	void FOVManager::ApplyThirdPersonFOV(float fov)
 	{
+		if (DeferFOVForVATS()) {
+			return;
+		}
+
 		SetEngineFloatSetting("fDefaultWorldFOV:Display", fov, "ApplyThirdPersonFOV");
 		// Same reasoning as ApplyFirstPersonFOV - skip the runtime
 		// write while aiming. 3rd-person FOV isn't visible during
@@ -695,17 +714,29 @@ namespace FOVSlider
 
 	void FOVManager::ApplyThirdPersonAimFOV(float fov)
 	{
+		if (DeferFOVForVATS()) {
+			return;
+		}
+
 		// Lives in GameSettingCollection (esm-defined default key).
 		SetEngineFloatSetting("f3rdPersonAimFOV:Camera", fov, "ApplyThirdPersonAimFOV");
 	}
 
 	void FOVManager::ApplyCameraDistance(float distance)
 	{
+		if (DeferFOVForVATS()) {
+			return;
+		}
+
 		SetEngineFloatSetting("fNearDistance:Display", distance, "ApplyCameraDistance");
 	}
 
 	void FOVManager::ApplyViewmodelFOV(float vmFov)
 	{
+		if (DeferFOVForVATS()) {
+			return;
+		}
+
 		if (vmFov < 30.0f)  vmFov = 30.0f;
 		if (vmFov > 160.0f) vmFov = 160.0f;
 
@@ -741,19 +772,16 @@ namespace FOVSlider
 			// `PlayerCamera::worldFOV` has been clobbered to X
 			// (= viewmodel value, not the saved 3rd-person FOV).
 			//
-			// Re-assert the saved 3rd-person FOV here so a 1st->3rd
-			// camera transition doesn't briefly show the viewmodel
-			// value. The 1st-person re-assert is gated on Aiming
-			// because the engine's fovAdjust system owns runtime
-			// firstPersonFOV during ADS and our write would race it.
-			// 3rd-person FOV isn't ADS-related, so we always restore
-			// it (worst case: harmless write while in iron-sights).
+			// Re-assert ONLY worldFOV (3rd-person camera). We must
+			// NOT write PlayerCamera::firstPersonFOV here — doing so
+			// re-couples the viewmodel to the camera value, undoing
+			// the decoupling that `fov X Y` just established. The
+			// `fov` command already set firstPersonFOV correctly.
 			const float savedThird = Settings::GetSingleton()->thirdPersonFOV.load();
-			const bool writeFirst = context.load() != FOVContext::Aiming;
 			WriteRuntimeCameraFOV(
-				writeFirst ? camFov : std::numeric_limits<float>::quiet_NaN(),
+				std::numeric_limits<float>::quiet_NaN(),
 				savedThird,
-				writeFirst ? "ApplyViewmodelFOV/post-fov" : "ApplyViewmodelFOV/post-fov(aim)");
+				"ApplyViewmodelFOV/post-fov(worldOnly)");
 		}
 	}
 
@@ -762,6 +790,12 @@ namespace FOVSlider
 	// ============================================================
 	void FOVManager::InterpolateViewmodelFOV(float from, float to, int frames)
 	{
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
+		if (DeferFOVForVATS()) {
+			return;
+		}
 		if (frames <= 1 || std::fabs(to - from) < 0.05f) {
 			ApplyViewmodelFOV(to);
 			return;
@@ -804,6 +838,7 @@ namespace FOVSlider
 			return s->firstPersonFOV.load();
 		case FOVContext::PipBoy:
 		case FOVContext::Terminal:
+		case FOVContext::VATS:
 		case FOVContext::Default:
 		default:
 			return s->firstPersonFOV.load();
@@ -816,6 +851,7 @@ namespace FOVSlider
 		switch (context.load()) {
 		case FOVContext::PipBoy:    return s->pipBoyFOV.load();
 		case FOVContext::Terminal:  return s->terminalFOV.load();
+		case FOVContext::VATS:
 		case FOVContext::Aiming:
 		case FOVContext::Default:
 		default:
@@ -830,6 +866,10 @@ namespace FOVSlider
 	{
 		Settings::GetSingleton()->firstPersonFOV.store(v);
 		Settings::GetSingleton()->Save();
+
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
 
 		// Only apply 1st-person FOV directly when we're not currently
 		// aiming - aiming has its own value.
@@ -884,6 +924,9 @@ namespace FOVSlider
 	{
 		Settings::GetSingleton()->thirdPersonFOV.store(v);
 		Settings::GetSingleton()->Save();
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
 		ApplyThirdPersonFOV(v);
 	}
 
@@ -891,6 +934,10 @@ namespace FOVSlider
 	{
 		Settings::GetSingleton()->viewmodelFOV.store(v);
 		Settings::GetSingleton()->Save();
+
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
 
 		// Camera defaults first (`fov X Y` always clobbers runtime — we fix
 		// afterward). When FP's WBFOV is driving the weapon, omit our own
@@ -910,6 +957,9 @@ namespace FOVSlider
 	{
 		Settings::GetSingleton()->pipBoyFOV.store(v);
 		Settings::GetSingleton()->Save();
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
 		// If we're currently inside the PipBoy, apply live.
 		if (!IsPlayerInPowerArmor() && context.load() == FOVContext::PipBoy) {
 			ApplyViewmodelFOV(v);
@@ -920,6 +970,9 @@ namespace FOVSlider
 	{
 		Settings::GetSingleton()->terminalFOV.store(v);
 		Settings::GetSingleton()->Save();
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
 		if (context.load() == FOVContext::Terminal) {
 			ApplyViewmodelFOV(v);
 		}
@@ -929,6 +982,9 @@ namespace FOVSlider
 	{
 		Settings::GetSingleton()->cameraDistance.store(v);
 		Settings::GetSingleton()->Save();
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
 		ApplyCameraDistance(v);
 	}
 
@@ -936,6 +992,9 @@ namespace FOVSlider
 	{
 		Settings::GetSingleton()->enableFirstPersonAimFOV.store(v);
 		Settings::GetSingleton()->Save();
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
 		// If we're currently aiming, recompute camera FOV instantly.
 		if (context.load() == FOVContext::Aiming) {
 			ApplyFirstPersonFOV(GetTargetCameraFOV());
@@ -946,6 +1005,9 @@ namespace FOVSlider
 	{
 		Settings::GetSingleton()->firstPersonAimFOV.store(v);
 		Settings::GetSingleton()->Save();
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
 		if (IsPlayerInIronSights() && Settings::GetSingleton()->enableFirstPersonAimFOV.load()) {
 			ApplyFirstPersonFOV(v);
 		}
@@ -955,6 +1017,9 @@ namespace FOVSlider
 	{
 		Settings::GetSingleton()->thirdPersonAimFOV.store(v);
 		Settings::GetSingleton()->Save();
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
 		ApplyThirdPersonAimFOV(v);
 	}
 
@@ -966,6 +1031,11 @@ namespace FOVSlider
 		auto* s = Settings::GetSingleton();
 
 		LogEngineSnapshot("ApplyAllSettings/before");
+
+		if (!s->pluginEnabled.load()) {
+			logger::info("[FOVSlider] ApplyAllSettings skipped (plugin disabled)");
+			return;
+		}
 
 		// Camera (1st-person world) FOV. This is the value FPInertia's
 		// WeaponFOV picks up as the Y-arg of `fov X Y`, so we set it
@@ -1022,13 +1092,21 @@ namespace FOVSlider
 	// script every call), so we issue it ONCE at the end with the
 	// final Y = saved camera FOV. FPInertia then re-reads the engine
 	// value on its next tick.
-	void FOVManager::LerpAllSettings(int durationMs, int stepMs, bool a_includeViewmodel)
+	void FOVManager::LerpAllSettings(int durationMs, int stepMs, bool a_includeViewmodel,
+		std::optional<float> a_firstPersonTarget,
+		std::optional<float> a_thirdPersonTarget)
 	{
+		if (!PluginEffectsEnabled()) {
+			logger::trace("[FOVSlider] LerpAllSettings skipped (plugin disabled)");
+			return;
+		}
+
 		// Cancel any in-flight interpolation. Anyone holding the old
 		// `myGen` will see interpGeneration change and bail.
 		const std::uint64_t myGen = ++interpGeneration;
 
-		std::thread([this, myGen, durationMs, stepMs, a_includeViewmodel]() {
+		std::thread([this, myGen, durationMs, stepMs, a_includeViewmodel, a_firstPersonTarget,
+		                a_thirdPersonTarget]() {
 			auto* s = Settings::GetSingleton();
 
 			activeLerps.fetch_add(1);
@@ -1061,8 +1139,8 @@ namespace FOVSlider
 				}
 			}
 
-			const float targetFirst = s->firstPersonFOV.load();
-			const float targetThird = s->thirdPersonFOV.load();
+			const float targetFirst = a_firstPersonTarget.value_or(s->firstPersonFOV.load());
+			const float targetThird = a_thirdPersonTarget.value_or(s->thirdPersonFOV.load());
 
 			// Apply non-visible settings instantly at the start so
 			// they're correct for the entire lerp window (and any
@@ -1101,16 +1179,19 @@ namespace FOVSlider
 			ApplyFirstPersonFOV(targetFirst);
 			ApplyThirdPersonFOV(targetThird);
 
-			// Optional finalizer: viewmodel apply + FPInertia refresh.
-			// See header docs - Phase 2 load retries pass false to
-			// avoid retriggering FPInertia's WBFOV apply (which would
-			// clobber the runtime camera fields via the engine's
-			// `fov X Y` quirk on every retry).
-			if (a_includeViewmodel) {
+			// Re-establish viewmodel decoupling. The lerp wrote
+			// PlayerCamera::firstPersonFOV on every step which
+			// re-couples the viewmodel to the camera value. Issue
+			// `fov vmFOV camFOV` to restore the intended split.
+			// When FPInertia is present, skip this on camera-only
+			// retries to avoid retriggering WBFOV's `fov X Y` loop.
+			if (a_includeViewmodel || !fpInertiaPresent.load()) {
 				lastAppliedCamera.store(-1.0f);
 				lastAppliedViewmodel.store(-1.0f);
 				ApplyViewmodelFOV(GetTargetViewmodelFOV());
-				NotifyFPInertia();
+				if (a_includeViewmodel) {
+					NotifyFPInertia();
+				}
 			}
 
 			LogEngineSnapshot(a_includeViewmodel ? "LerpAll/end" : "LerpAll/end(camera-only)");
@@ -1156,6 +1237,11 @@ namespace FOVSlider
 			// flag and skip the full retry sequence (drift watcher
 			// maintains INI from that point on).
 			initialLoadApplied.store(true);
+
+			if (!s->pluginEnabled.load()) {
+				logger::info("[FOVSlider] ScheduleLoadRetry skipped (plugin disabled)");
+				return;
+			}
 
 			// ---- PHASE 1: smooth load-lerp ----
 			// When FPInertia is loaded, defer the load-lerp viewmodel apply;
@@ -1216,6 +1302,10 @@ namespace FOVSlider
 	// ============================================================
 	void FOVManager::OnPipBoyOpening()
 	{
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
+
 		auto* s = Settings::GetSingleton();
 		// In Power Armor the pipboy is a HUD overlay that doesn't change
 		// the viewmodel - skip the override (matches the original mod).
@@ -1253,6 +1343,10 @@ namespace FOVSlider
 
 	void FOVManager::OnPipBoyClosing()
 	{
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
+
 		auto* s = Settings::GetSingleton();
 		if (IsPlayerInPowerArmor()) {
 			logger::info("[FOVSlider] OnPipBoyClosing (skipped - in PA)");
@@ -1296,6 +1390,10 @@ namespace FOVSlider
 
 	void FOVManager::OnTerminalEntered()
 	{
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
+
 		auto* s = Settings::GetSingleton();
 		logger::info("[FOVSlider] OnTerminalEntered - context -> Terminal");
 		LogEngineSnapshot("TerminalEntered/before");
@@ -1314,6 +1412,10 @@ namespace FOVSlider
 
 	void FOVManager::OnTerminalExited()
 	{
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
+
 		auto* s = Settings::GetSingleton();
 		logger::info("[FOVSlider] OnTerminalExited - context Terminal -> Default");
 		LogEngineSnapshot("TerminalExited/before");
@@ -1339,6 +1441,10 @@ namespace FOVSlider
 
 	void FOVManager::OnSightedStateEnter()
 	{
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
+
 		auto* s = Settings::GetSingleton();
 		if (!s->enableFirstPersonAimFOV.load()) {
 			logger::trace("[FOVSlider] OnSightedStateEnter - skipped (aim FOV disabled)");
@@ -1377,12 +1483,13 @@ namespace FOVSlider
 			const float delta = to - from;
 			for (int i = 0; i < steps; ++i) {
 				if (interpGeneration.load() != myGen) return;
+				if (DeferFOVForVATS()) return;
 				const float t   = static_cast<float>(i + 1) / static_cast<float>(steps);
 				const float cur = from + delta * t;
 				SetEngineFloatSetting("fDefault1stPersonFOV:Display", cur, "AimLerp(in)");
 				std::this_thread::sleep_for(std::chrono::milliseconds(6));
 			}
-			if (interpGeneration.load() == myGen) {
+			if (interpGeneration.load() == myGen && !DeferFOVForVATS()) {
 				SetEngineFloatSetting("fDefault1stPersonFOV:Display", to, "AimLerp(in)Final");
 			}
 		}).detach();
@@ -1390,6 +1497,15 @@ namespace FOVSlider
 
 	void FOVManager::OnSightedStateExit()
 	{
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
+
+		if (context.load() == FOVContext::VATS) {
+			logger::trace("[FOVSlider] OnSightedStateExit skipped (VATS owns FOV)");
+			return;
+		}
+
 		auto* s = Settings::GetSingleton();
 		if (!s->enableFirstPersonAimFOV.load()) {
 			logger::trace("[FOVSlider] OnSightedStateExit - skipped (aim FOV disabled)");
@@ -1418,12 +1534,13 @@ namespace FOVSlider
 			const float delta = to - from;
 			for (int i = 0; i < steps; ++i) {
 				if (FOVManager::GetSingleton()->interpGeneration.load() != myGen) return;
+				if (DeferFOVForVATS()) return;
 				const float t   = static_cast<float>(i + 1) / static_cast<float>(steps);
 				const float cur = from + delta * t;
 				FOVManager::SetEngineFloatSetting("fDefault1stPersonFOV:Display", cur, "AimLerp(out)");
 				std::this_thread::sleep_for(std::chrono::milliseconds(6));
 			}
-			if (FOVManager::GetSingleton()->interpGeneration.load() == myGen) {
+			if (FOVManager::GetSingleton()->interpGeneration.load() == myGen && !DeferFOVForVATS()) {
 				FOVManager::SetEngineFloatSetting("fDefault1stPersonFOV:Display", to, "AimLerp(out)Final");
 			}
 		}).detach();
@@ -1442,6 +1559,70 @@ namespace FOVSlider
 		}
 	}
 
+	void FOVManager::OnVATSBegin()
+	{
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
+
+		std::lock_guard lock(transitionMtx);
+		if (context.load() == FOVContext::VATS) {
+			return;
+		}
+		if (context.load() == FOVContext::PipBoy || context.load() == FOVContext::Terminal) {
+			logger::trace("[FOVSlider] OnVATSBegin ignored (context={})", ContextToString(context.load()));
+			return;
+		}
+
+		logger::info("[FOVSlider] OnVATSBegin - entering VATS (engine FOV)");
+		LogEngineSnapshot("VATSBegin/before");
+		NotifyFPInertiaLock(true);
+		context.store(FOVContext::VATS);
+		LogEngineSnapshot("VATSBegin/after");
+	}
+
+	void FOVManager::OnVATSEnd()
+	{
+		if (!PluginEffectsEnabled()) {
+			return;
+		}
+
+		FOVContext next = FOVContext::Default;
+		{
+			std::lock_guard lock(transitionMtx);
+			if (context.load() != FOVContext::VATS) {
+				logger::trace("[FOVSlider] OnVATSEnd ignored (context={})", ContextToString(context.load()));
+				return;
+			}
+
+			auto* s = Settings::GetSingleton();
+			if (IsPlayerInIronSights() && s->enableFirstPersonAimFOV.load()) {
+				next = FOVContext::Aiming;
+			} else {
+				next = FOVContext::Default;
+			}
+			context.store(next);
+		}
+
+		logger::info("[FOVSlider] OnVATSEnd - VATS -> {}", ContextToString(next));
+		LogEngineSnapshot("VATSEnd/transition");
+
+		auto* s = Settings::GetSingleton();
+		const int dur = std::clamp(s->driftCorrectDurationMs.load(), 100, 600);
+		const bool includeVm = !fpInertiaPresent.load();
+		std::optional<float> aim1st;
+		if (next == FOVContext::Aiming) {
+			aim1st = s->firstPersonAimFOV.load();
+		}
+
+		LerpAllSettings(dur, 8, includeVm, aim1st, std::nullopt);
+		NotifyFPInertia();
+
+		if (next == FOVContext::Default) {
+			ScheduleFPInertiaUnlock(dur + 50);
+		}
+	}
+
 	// ============================================================
 	// FPInertia handshake
 	// ============================================================
@@ -1451,6 +1632,11 @@ namespace FOVSlider
 		auto* msg = F4SE::GetMessagingInterface();
 		if (!msg) return;
 		msg->Dispatch(kFPInertia_RefreshMsg, nullptr, 0, "FPInertia");
+	}
+
+	void FOVManager::ReleaseFPExternalLock()
+	{
+		NotifyFPInertiaLock(false);
 	}
 
 	void FOVManager::NotifyFPInertiaLock(bool locked)

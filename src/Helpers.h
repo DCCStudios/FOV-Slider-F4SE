@@ -40,6 +40,14 @@ namespace FOVSlider
 		return false;
 	}
 
+	// True while the VATS camera state owns the view (engine-driven FOV).
+	inline bool IsPlayerCameraVATS()
+	{
+		auto* camera = RE::PlayerCamera::GetSingleton();
+		return camera && camera->currentState &&
+		       camera->currentState->id.get() == RE::CameraState::kVATS;
+	}
+
 	// Resolve the player's currently-occupied furniture (the chair/terminal
 	// they're sitting at). Returns nullptr if not interacting with any.
 	inline RE::TESObjectREFR* GetPlayerCurrentFurniture()
