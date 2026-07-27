@@ -4,9 +4,6 @@
 #include "FOVManager.h"
 #include "Helpers.h"
 
-#include "RE/Bethesda/PlayerCharacter.h"
-#include "RE/Bethesda/TESCamera.h"
-
 namespace FOVSlider::Menu
 {
 	using namespace ImGuiMCP;
@@ -69,8 +66,16 @@ namespace FOVSlider::Menu
 	// ============================================================
 	void Register()
 	{
+		static std::atomic_bool registered{ false };
+
+		if (registered.load()) {
+			return;
+		}
 		if (!F4SEMenuFramework::IsInstalled()) {
 			logger::warn("[FOVSlider] F4SE Menu Framework not installed - in-game menu disabled");
+			return;
+		}
+		if (registered.exchange(true)) {
 			return;
 		}
 
@@ -470,7 +475,7 @@ namespace FOVSlider::Menu
 			// ---- FPInertia ----
 			TextColored(ImVec4(0.6f, 0.85f, 1.0f, 1.0f), "FPInertia");
 			Spacing();
-			if (auto info = F4SE::GetPluginInfo("FPInertia"); info.has_value()) {
+			if (const auto* info = F4SE::GetPluginInfo("FPInertia")) {
 				Text("Detected: yes (api version %u)", info->version);
 				TextWrapped("Cross-plugin handshake is active. Pip-Boy / Terminal "
 				            "transitions lock FPInertia's WBFOV applies until our "

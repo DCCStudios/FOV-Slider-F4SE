@@ -12,27 +12,6 @@ namespace Plugin
 
 namespace
 {
-	// ============================================================
-	// Logging setup
-	// ============================================================
-	void InitializeLogging()
-	{
-		auto path = F4SE::log::log_directory();
-		if (!path) {
-			F4SE::stl::report_and_fail("[FOVSlider] F4SE log_directory missing"sv);
-		}
-		*path /= std::format("{}.log"sv, Plugin::NAME);
-
-		auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(path->string(), true);
-		auto log  = std::make_shared<spdlog::logger>("global", std::move(sink));
-		// Start at info; the actual level is applied AFTER Settings::Load
-		// so the user-configurable [Diagnostics] bVerboseLogging takes
-		// effect on the very first session.
-		log->set_level(spdlog::level::info);
-		log->flush_on(spdlog::level::info);
-		set_default_logger(std::move(log));
-	}
-
 	// Re-apply the spdlog level based on the loaded settings. Called
 	// after Settings::Load so the user can flip verbosity in the INI
 	// without needing a debug build.
@@ -55,13 +34,19 @@ namespace
 		if (!msg) return;
 
 		switch (msg->type) {
+		case F4SE::MessagingInterface::kPostLoad:
+			// Every plugin has returned from F4SEPlugin_Load at this point.
+			// Registering here makes Menu Framework discovery independent of
+			// the DLL ordering in plugins.txt.
+			FOVSlider::Menu::Register();
+			break;
+
 		case F4SE::MessagingInterface::kGameDataReady:
 			logger::info("[FOVSlider] kGameDataReady - initializing");
 			FOVSlider::Settings::GetSingleton()->Load();
 			ApplyLogLevelFromSettings();
 			FOVSlider::FOVManager::GetSingleton()->Init();
 			FOVSlider::RegisterEventSinks();
-			FOVSlider::Menu::Register();
 			FOVSlider::FOVManager::GetSingleton()->LogEngineSnapshot("kGameDataReady/before-apply");
 			// Apply initial state. The world camera FOV won't have been
 			// fully initialized yet on cold-boot, but the apply will land
@@ -109,7 +94,7 @@ namespace
 			auto* mgr = FOVSlider::FOVManager::GetSingleton();
 
 			// Other plugins are now loaded - safe to log dependency status.
-			if (auto info = F4SE::GetPluginInfo("FPInertia"); info.has_value()) {
+			if (const auto* info = F4SE::GetPluginInfo("FPInertia")) {
 				logger::info("[FOVSlider] FPInertia v{} detected — coordinating camera/vm applies on load transitions",
 					info->version);
 				mgr->fpInertiaPresent.store(true);
@@ -140,7 +125,7 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Query(const F4SE::QueryInterface* a
 	}
 
 	const auto ver = a_f4se->RuntimeVersion();
-	if (ver < F4SE::RUNTIME_1_10_162) {
+	if (ver < F4SE::RUNTIME_1_10_163) {
 		return false;
 	}
 	return true;
@@ -151,11 +136,19 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Query(const F4SE::QueryInterface* a
 // ============================================================
 extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* a_f4se)
 {
-	InitializeLogging();
+	F4SE::Init(a_f4se, {
+		.log = true,
+		.logName = Plugin::NAME.data(),
+		.trampoline = false,
+	});
+
 	logger::info("{} v{}.{}.{} loading", Plugin::NAME,
 	             Plugin::VERSION[0], Plugin::VERSION[1], Plugin::VERSION[2]);
-
-	F4SE::Init(a_f4se);
+	logger::info(
+		"Runtime {} selected ({})",
+		a_f4se->RuntimeVersion().string(),
+		REX::FModule::IsRuntimeOG() ? "OG" :
+			REX::FModule::IsRuntimeNG() ? "NG" : "AE");
 
 	auto* messaging = F4SE::GetMessagingInterface();
 	if (!messaging || !messaging->RegisterListener(MessageCallback)) {

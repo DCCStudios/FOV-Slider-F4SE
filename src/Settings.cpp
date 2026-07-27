@@ -7,6 +7,37 @@
 #include <KnownFolders.h>
 #include <ShlObj.h>
 
+namespace
+{
+	// Resolve this plugin's own DLL path. The process working directory is not
+	// reliable under launchers such as Mod Organizer 2.
+	std::filesystem::path GetThisModulePath()
+	{
+		HMODULE module = nullptr;
+		constexpr DWORD flags =
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+
+		if (!::GetModuleHandleExW(
+				flags,
+				reinterpret_cast<LPCWSTR>(&GetThisModulePath),
+				&module)) {
+			return {};
+		}
+
+		std::vector<wchar_t> pathBuffer(32768);
+		const DWORD length = ::GetModuleFileNameW(
+			module,
+			pathBuffer.data(),
+			static_cast<DWORD>(pathBuffer.size()));
+		if (length == 0 || length >= pathBuffer.size()) {
+			return {};
+		}
+
+		return std::filesystem::path(std::wstring_view(pathBuffer.data(), length));
+	}
+}
+
 namespace FOVSlider
 {
 	static constexpr const char* kSection_Plugin      = "Plugin";
@@ -85,8 +116,14 @@ namespace FOVSlider
 
 	std::filesystem::path Settings::GetIniPath() const
 	{
-		// Next to the DLL: Data\F4SE\Plugins\FOV Slider F4SE.ini
-		return std::filesystem::current_path() / "Data" / "F4SE" / "Plugins" / "FOV Slider F4SE.ini";
+		const auto modulePath = GetThisModulePath();
+		if (modulePath.empty()) {
+			return {};
+		}
+
+		// The shipping INI lives beside FOVSliderF4SE.dll under
+		// Data\F4SE\Plugins, independent of the process working directory.
+		return modulePath.parent_path() / "FOV Slider F4SE.ini";
 	}
 
 	bool Settings::Load()
@@ -100,6 +137,10 @@ namespace FOVSlider
 			std::lock_guard lock(ioMtx);
 
 		const auto path = GetIniPath();
+		if (path.empty()) {
+			logger::error("[FOVSlider] Could not resolve the plugin DLL path; settings were not loaded");
+			return false;
+		}
 
 		CSimpleIniA ini;
 		ini.SetUnicode();
@@ -204,6 +245,10 @@ namespace FOVSlider
 		std::lock_guard lock(ioMtx);
 
 		const auto path = GetIniPath();
+		if (path.empty()) {
+			logger::error("[FOVSlider] Could not resolve the plugin DLL path; settings were not saved");
+			return false;
+		}
 
 		// Make sure the parent dir exists; on a clean install the user might
 		// have only the bare F4SE\Plugins folder set up.

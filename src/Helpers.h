@@ -1,8 +1,6 @@
 #pragma once
 
-#include "RE/Bethesda/Actor.h"
-#include "RE/Bethesda/PlayerCharacter.h"
-#include "RE/Bethesda/TESCamera.h"
+#include "RE/Fallout.h"
 
 namespace FOVSlider
 {
@@ -29,7 +27,7 @@ namespace FOVSlider
 		// gunState is a 4-bit bitfield on ActorState. Values 6 (kSighted)
 		// and 8 (kFireSighted) are the verified ADS states across vanilla
 		// and custom animation graphs.
-		const std::uint32_t gs = player->gunState;
+		const auto gs = static_cast<std::uint32_t>(player->gunState);
 		if (gs == 6 || gs == 8) return true;
 
 		auto* camera = RE::PlayerCamera::GetSingleton();

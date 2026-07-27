@@ -4,6 +4,8 @@ out/
 Compile/
 install/
 .cache/
+.xmake/
+build.xmake/
 .vs/
 *.dll
 *.pdb

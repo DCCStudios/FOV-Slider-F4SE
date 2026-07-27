@@ -60,12 +60,10 @@ namespace FOVSlider
 			}
 		}
 		if (auto* gs = RE::GameSettingCollection::GetSingleton()) {
-			for (auto& kv : gs->settings) {
-				if (kv.second && kv.second->GetKey() == a_key &&
-				    kv.second->GetType() == RE::Setting::SETTING_TYPE::kFloat) {
-					a_out = kv.second->GetFloat();
-					return true;
-				}
+			if (auto* setting = gs->GetSetting(a_key);
+				setting && setting->GetType() == RE::Setting::SETTING_TYPE::kFloat) {
+				a_out = setting->GetFloat();
+				return true;
 			}
 		}
 		return false;
@@ -105,14 +103,11 @@ namespace FOVSlider
 		}
 		if (!ok) {
 			if (auto* gs = RE::GameSettingCollection::GetSingleton()) {
-				for (auto& kv : gs->settings) {
-					if (kv.second && kv.second->GetKey() == a_key &&
-					    kv.second->GetType() == RE::Setting::SETTING_TYPE::kFloat) {
-						kv.second->SetFloat(a_value);
-						ok = true;
-						hitCollection = "GameSetting";
-						break;
-					}
+				if (auto* setting = gs->GetSetting(a_key);
+					setting && setting->GetType() == RE::Setting::SETTING_TYPE::kFloat) {
+					setting->SetFloat(a_value);
+					ok = true;
+					hitCollection = "GameSetting";
 				}
 			}
 		}

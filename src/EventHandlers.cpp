@@ -111,47 +111,63 @@ namespace FOVSlider
 	}
 
 	// ============================================================
+	// Player animation event receiver hook
+	// ============================================================
+	namespace
+	{
+		// TESObjectREFR's BSTEventSink<BSAnimationGraphEvent> base is the
+		// fourth vtable in PlayerCharacter::VTABLE. Its ProcessEvent method is
+		// vfunc 1. This vtable ID and base order are shared by OG, NG, and AE.
+		using ProcessEventFn = RE::BSEventNotifyControl(*)(
+			void*,
+			const RE::BSAnimationGraphEvent&,
+			RE::BSTEventSource<RE::BSAnimationGraphEvent>*);
+
+		ProcessEventFn g_originalPlayerProcessEvent = nullptr;
+		std::atomic_bool g_playerEventHookInstalled{ false };
+
+		RE::BSEventNotifyControl HookedPlayerProcessEvent(
+			void* a_this,
+			const RE::BSAnimationGraphEvent& a_event,
+			RE::BSTEventSource<RE::BSAnimationGraphEvent>* a_source)
+		{
+			AnimSink::GetSingleton()->ProcessEvent(a_event);
+
+			// Always continue through the previously installed function. This
+			// preserves the engine handler and chains correctly with plugins
+			// that hook this same vtable before or after FOV Slider.
+			return g_originalPlayerProcessEvent(a_this, a_event, a_source);
+		}
+
+		void InstallPlayerAnimationEventHook()
+		{
+			if (g_playerEventHookInstalled.exchange(true)) {
+				return;
+			}
+
+			REL::Relocation<std::uintptr_t> playerAnimationEventVtable{
+				RE::PlayerCharacter::VTABLE[3]
+			};
+			g_originalPlayerProcessEvent = reinterpret_cast<ProcessEventFn>(
+				playerAnimationEventVtable.write_vfunc(1, &HookedPlayerProcessEvent));
+
+			if (!g_originalPlayerProcessEvent) {
+				g_playerEventHookInstalled.store(false);
+				REX::FAIL("[FOVSlider] Player animation event vtable hook returned a null original");
+			}
+
+			logger::info(
+				"[FOVSlider] Player animation event hook installed "
+				"(PlayerCharacter::VTABLE[3], vfunc 1)");
+		}
+	}
+
+	// ============================================================
 	// AnimSink - sighted state + camera override (terminal furniture)
 	// ============================================================
-	bool AnimSink::Register()
+	void AnimSink::ProcessEvent(const RE::BSAnimationGraphEvent& a_event)
 	{
-		auto* player = RE::PlayerCharacter::GetSingleton();
-		if (!player) return false;
-
-		RE::BSScrapArray<RE::BSTEventSource<RE::BSAnimationGraphEvent>*> sources;
-		if (!RE::BGSAnimationSystemUtils::GetEventSourcePointersFromGraph(player, sources)) {
-			return false;
-		}
-		if (sources.empty()) return false;
-
-		for (auto* src : sources) {
-			if (src) src->RegisterSink(this);
-		}
-		registered.store(true);
-		logger::info("[FOVSlider] Registered animation event sink ({} sources)", sources.size());
-		return true;
-	}
-
-	void AnimSink::Unregister()
-	{
-		if (!registered.load()) return;
-		auto* player = RE::PlayerCharacter::GetSingleton();
-		if (!player) return;
-
-		RE::BSScrapArray<RE::BSTEventSource<RE::BSAnimationGraphEvent>*> sources;
-		if (RE::BGSAnimationSystemUtils::GetEventSourcePointersFromGraph(player, sources)) {
-			for (auto* src : sources) {
-				if (src) src->UnregisterSink(this);
-			}
-		}
-		registered.store(false);
-	}
-
-	RE::BSEventNotifyControl AnimSink::ProcessEvent(
-		const RE::BSAnimationGraphEvent&                a_event,
-		RE::BSTEventSource<RE::BSAnimationGraphEvent>*)
-	{
-		const auto& evt = a_event.animEvent;
+		const auto& evt = a_event.tag;
 		auto* fov = FOVManager::GetSingleton();
 
 		// Sighted-state hooks for the optional First-Person Aim FOV feature.
@@ -160,12 +176,12 @@ namespace FOVSlider
 		if (evt == "sightedStateEnter" || evt == "SightedStateEnter") {
 			logger::info("[FOVSlider] anim event '{}'", evt.c_str());
 			fov->OnSightedStateEnter();
-			return RE::BSEventNotifyControl::kContinue;
+			return;
 		}
 		if (evt == "sightedStateExit" || evt == "SightedStateExit") {
 			logger::info("[FOVSlider] anim event '{}'", evt.c_str());
 			fov->OnSightedStateExit();
-			return RE::BSEventNotifyControl::kContinue;
+			return;
 		}
 
 		// Terminal entry: the player triggers `CameraOverrideStart` when
@@ -205,7 +221,7 @@ namespace FOVSlider
 				fov->OnTerminalEntered();
 				wasOnTerminal.store(true);
 			}
-			return RE::BSEventNotifyControl::kContinue;
+			return;
 		}
 
 		// CameraOverrideEnd: belt-and-suspenders exit pathway in case
@@ -224,10 +240,8 @@ namespace FOVSlider
 			if (hadTerm && fov->GetContext() == FOVContext::Terminal) {
 				fov->OnTerminalExited();
 			}
-			return RE::BSEventNotifyControl::kContinue;
+			return;
 		}
-
-		return RE::BSEventNotifyControl::kContinue;
 	}
 
 	// ============================================================
@@ -236,32 +250,13 @@ namespace FOVSlider
 	void RegisterEventSinks()
 	{
 		MenuSink::GetSingleton()->Register();
-
-		// AnimSink may fail until the player's graph is ready; spawn a
-		// retrying worker so we don't block the messaging callback.
-		std::thread([]() {
-			auto* sink = AnimSink::GetSingleton();
-			for (int i = 0; i < 30; ++i) {  // ~15s max
-				if (sink->IsRegistered()) return;
-				if (sink->Register()) return;
-				std::this_thread::sleep_for(std::chrono::milliseconds(500));
-			}
-			logger::warn("[FOVSlider] Animation event sink failed to register after 30 retries");
-		}).detach();
+		InstallPlayerAnimationEventHook();
 	}
 
 	void OnGameLoaded()
 	{
-		// MenuOpenCloseEvent registrations survive game loads, but the
-		// animation graph is rebuilt - re-register the anim sink.
-		AnimSink::GetSingleton()->Unregister();
-		std::thread([]() {
-			auto* sink = AnimSink::GetSingleton();
-			for (int i = 0; i < 30; ++i) {
-				if (sink->Register()) return;
-				std::this_thread::sleep_for(std::chrono::milliseconds(500));
-			}
-			logger::warn("[FOVSlider] Animation event sink failed to re-register after game load");
-		}).detach();
+		// The PlayerCharacter vtable hook survives graph rebuilds. UI sink
+		// registration is idempotent and is refreshed defensively.
+		MenuSink::GetSingleton()->Register();
 	}
 }

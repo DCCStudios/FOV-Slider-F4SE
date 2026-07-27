@@ -1,3 +1,5 @@
+#pragma once
+
 #include <windows.h>
 
 #include <cassert>
@@ -5,7 +7,17 @@
 #include <locale>
 #include <string>
 
-static auto menuFramework = GetModuleHandle(L"F4SEMenuFramework");
+// F4SE may load plugins in any order. Resolve the framework module when an
+// API call is made instead of caching a null handle during this DLL's load.
+[[nodiscard]] inline HMODULE F4SEMenuFramework_GetHostModule() noexcept
+{
+    HMODULE module = ::GetModuleHandleW(L"F4SEMenuFramework.dll");
+    if (!module) {
+        module = ::GetModuleHandleW(L"F4SEMenuFramework");
+    }
+    return module;
+}
+#define menuFramework (F4SEMenuFramework_GetHostModule())
 #define MENU_WINDOW F4SEMenuFramework::Model::WindowInterface*
 namespace ImGuiMCP {
     typedef struct ImVec2 ImVec2;
@@ -18,8 +30,7 @@ namespace ImGuiMCP {
 namespace F4SEMenuFramework {
     using namespace ImGuiMCP;
     inline bool IsInstalled() {
-        constexpr auto dllPath = "Data/F4SE/Plugins/F4SEMenuFramework.dll";
-        return std::filesystem::exists(dllPath);
+        return F4SEMenuFramework_GetHostModule() != nullptr;
     }
 
     namespace Model {

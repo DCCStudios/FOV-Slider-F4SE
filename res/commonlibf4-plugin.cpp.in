@@ -1,0 +1,22 @@
+#include <F4SE/F4SE.h>
+
+// NG and AE F4SE loaders read this export before calling F4SEPlugin_Load.
+// OG uses the legacy F4SEPlugin_Query export retained in main.cpp.
+F4SE_PLUGIN_VERSION = []() noexcept {
+	F4SE::PluginVersionData version{};
+	version.PluginVersion({
+		${COMMONLIB_PLUGIN_VERSION_MAJOR},
+		${COMMONLIB_PLUGIN_VERSION_MINOR},
+		${COMMONLIB_PLUGIN_VERSION_PATCH},
+		0
+	});
+	version.PluginName("${COMMONLIB_PLUGIN_NAME}");
+	version.AuthorName("${COMMONLIB_PLUGIN_AUTHOR}");
+	version.UsesAddressLibrary(true);
+	version.UsesAddressLibraryNG(true);
+	version.UsesSigScanning(false);
+	version.IsLayoutDependent(true);
+	version.IsLayoutDependentNG(true);
+	version.HasNoStructUse(false);
+	return version;
+}();
