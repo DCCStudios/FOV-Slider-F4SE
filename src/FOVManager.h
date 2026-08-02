@@ -77,9 +77,37 @@ namespace FOVSlider
 
 		// Schedule a deferred re-apply of all settings to defeat the
 		// engine's late camera initialization on game load. Spawns a
-		// detached worker that runs the smooth load-lerp followed by
-		// slower safety retries (each retry is also a smooth lerp).
+		// detached worker that:
+		//   Phase 0 - applies ALL final values instantly (the load screen
+		//             still covers the frame, so a hard-set is invisible),
+		//   Phase 1 - re-asserts the INI source-of-truth every 50 ms for
+		//             as long as LoadingMenu / FaderMenu keeps the screen
+		//             covered, defeating the engine's mid-load resets
+		//             before the player can see them,
+		//   Phase 2 - after the fade lifts, runs the slower safety
+		//             retries as smooth lerps (visible corrections must
+		//             never snap).
 		void ScheduleLoadRetry();
+
+		// In-session save load variant: instant re-assert while the load
+		// screen covers the frame, then hand off to the drift watcher.
+		// No phase-2 retry lerps (historically they caused visible pops
+		// on quick in-session loads).
+		void ScheduleCoveredReassert();
+
+		// kPreLoadGame: hard-set the INI values BEFORE the engine starts
+		// loading the save, and start an early covered-maintenance worker
+		// so the values stay pinned from "load requested" all the way
+		// through the load screen.
+		void OnPreLoadGame();
+
+		// True while a full-screen occluder (LoadingMenu or FaderMenu) is
+		// on the UI stack - i.e. the player cannot see the world, so an
+		// instant FOV hard-set is invisible. Maintained by MenuSink.
+		[[nodiscard]] bool IsScreenCovered() const
+		{
+			return loadingMenuOpen.load() || faderMenuOpen.load();
+		}
 
 		// Engage the drift watcher's "hot poll" mode for `durationMs`
 		// ms (clamped to at least 100 ms). During the hot window, the
@@ -125,6 +153,18 @@ namespace FOVSlider
 		// Releases FPInertia external lock — call when disabling the plugin
 		// mid-session (Pip-Boy / aiming may have locked WBFOV applies).
 		void ReleaseFPExternalLock();
+
+		// Arm a short guard window after a terminal exit / Pip-Boy close:
+		// the engine's late first-person camera cut re-creates the camera
+		// at the menu override's FOV and slow-ramps back (visible as a
+		// zoom-out). While armed, OnCameraUpdateFrame corrects the drop
+		// in the same frame it happens, so it is never rendered.
+		void SuppressCameraTransitionZoom(const char* a_tag);
+
+		// Called from the FirstPersonState::Update vtable hook at the end
+		// of every first-person camera update pass (game thread). Applies
+		// the camera-cut guard correction, if a window is armed.
+		void OnCameraUpdateFrame();
 
 		// ---- Queries ----
 		FOVContext GetContext() const { return context.load(); }
@@ -234,6 +274,16 @@ namespace FOVSlider
 		// behind my back" detector.
 		void RunDriftWatcher();
 
+		// Re-assert the four INI-backed FOV settings every 50 ms for as
+		// long as the screen stays covered (LoadingMenu / FaderMenu),
+		// capped at 15 s as a wedge guard. INI-only by design: no console
+		// EXEC (nothing to re-couple the viewmodel), no runtime camera
+		// writes (nothing to fight the FP gunplay plugin's WBFOV), and
+		// the engine's own load finalize copies INI -> runtime before the
+		// fade lifts. Blocking - call from a worker thread only. Returns
+		// elapsed milliseconds for logging.
+		long long MaintainIniWhileCovered(const char* a_tag);
+
 		// Apply primitives - safe to call from main thread.
 		void ApplyFirstPersonFOV(float fov);
 		void ApplyThirdPersonFOV(float fov);
@@ -271,7 +321,24 @@ namespace FOVSlider
 
 	public:
 		// Set by main.cpp once kPostPostLoad resolves the plugin list.
+		// True when the FP gunplay plugin is loaded under either of its
+		// registration names (see fpPluginName below).
 		std::atomic<bool> fpInertiaPresent{ false };
+
+		// F4SE registration name of the detected FP gunplay plugin:
+		// "FPGunplayOverhaul" (current) or "FPInertia" (pre-rename builds).
+		// Empty when absent. Written ONCE from the kPostPostLoad callback,
+		// which runs before any gameplay-time dispatch reads it, so plain
+		// std::string is safe here.
+		std::string fpPluginName;
+
+		// Screen-occluder state, written by MenuSink on the game thread
+		// from MenuOpenCloseEvent (LoadingMenu / FaderMenu). Read via
+		// IsScreenCovered() by the load workers and the drift watcher to
+		// decide between instant (invisible) and smooth (visible)
+		// corrections.
+		std::atomic<bool> loadingMenuOpen{ false };
+		std::atomic<bool> faderMenuOpen{ false };
 
 		// Set to true after the first ScheduleLoadRetry completes Phase 1.
 		// Subsequent kPostLoadGame events (same session) skip the full retry
@@ -305,6 +372,14 @@ namespace FOVSlider
 		// hook - but the variable is here for future use).
 		std::atomic<bool>  driftWatcherStarted{ false };
 		std::atomic<bool>  driftWatcherStop{ false };
+
+		// Camera-cut guard window (steady_clock ms deadline; 0 = disarmed)
+		// and the number of same-frame corrections applied during the
+		// current window (logged on disarm). Written by
+		// SuppressCameraTransitionZoom, consumed by OnCameraUpdateFrame
+		// on the game thread.
+		std::atomic<long long> cutGuardUntilMs{ 0 };
+		std::atomic<int>       cutGuardCorrections{ 0 };
 
 		// Counter incremented on entry to LerpAllSettings and
 		// decremented on exit. The drift watcher checks this and

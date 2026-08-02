@@ -71,40 +71,39 @@ namespace FOVSlider
 			if (!open && fov->GetContext() == FOVContext::Terminal) {
 				fov->OnTerminalExited();
 			}
-		} else if (!open) {
-			// ---- Engine-restore trigger menus ----
-			// The diagnostic log identified three menus whose close
-			// causes the engine to write its own default FOVs at
-			// some point afterward. We engage the drift watcher's
-			// hot-poll mode right when these close so any stray
-			// engine write gets caught within ~16 ms instead of the
-			// cold 50 ms cadence.
-			//
-			// Why we don't rewrite our values directly here: the
-			// engine's restore happens 0.5 - 2 seconds AFTER the
-			// menu-close, with the timing depending on system load.
-			// A fixed-delay write would race the engine. The hot-poll
-			// watcher reacts to whatever the engine ACTUALLY writes,
-			// whenever it writes it.
+		} else if (name == kLoading || name == kFader) {
+			// ---- Screen occluders + engine-restore triggers ----
+			// Both menus fully cover the frame while open. Track that
+			// state so the load workers and drift watcher know when an
+			// instant FOV hard-set is invisible to the player
+			// (IsScreenCovered()).
 			if (name == kLoading) {
-				logger::info("[FOVSlider] LoadingMenu closed - engaging drift hot mode");
-				fov->TriggerDriftHotMode(settings->driftWatchHotDurationMs.load());
-			} else if (name == kFader) {
-				// Fader fires both as a load-screen fade-out AND as
-				// a generic UI fader, so the hot window we engage
-				// here is the same as Loading - back-to-back triggers
-				// just extend the deadline.
-				logger::info("[FOVSlider] FaderMenu closed - engaging drift hot mode");
-				fov->TriggerDriftHotMode(settings->driftWatchHotDurationMs.load());
-			} else if (name == kExamine) {
-				// ExamineMenu = workbenches, chem stations, cooking
-				// stations, etc. The engine's camera-override teardown
-				// for these writes default FOVs ~1.7 s after the menu
-				// closes, which is why hot mode needs to last that
-				// long (>= ~3 s).
-				logger::info("[FOVSlider] ExamineMenu closed - engaging drift hot mode");
+				fov->loadingMenuOpen.store(open);
+			} else {
+				fov->faderMenuOpen.store(open);
+			}
+
+			// On close, engage the drift watcher's hot-poll mode: the
+			// diagnostic log identified these closes as preceding the
+			// engine's own default-FOV writes by 0.5 - 2 s. A fixed-delay
+			// rewrite would race the engine; the hot-poll watcher reacts
+			// to whatever the engine ACTUALLY writes, whenever it writes
+			// it. (Fader fires both as a load-screen fade-out AND as a
+			// generic UI fader; back-to-back triggers just extend the
+			// hot deadline.)
+			if (!open) {
+				logger::info("[FOVSlider] {} closed - engaging drift hot mode",
+					name == kLoading ? "LoadingMenu" : "FaderMenu");
 				fov->TriggerDriftHotMode(settings->driftWatchHotDurationMs.load());
 			}
+		} else if (!open && name == kExamine) {
+			// ExamineMenu = workbenches, chem stations, cooking
+			// stations, etc. The engine's camera-override teardown
+			// for these writes default FOVs ~1.7 s after the menu
+			// closes, which is why hot mode needs to last that
+			// long (>= ~3 s).
+			logger::info("[FOVSlider] ExamineMenu closed - engaging drift hot mode");
+			fov->TriggerDriftHotMode(settings->driftWatchHotDurationMs.load());
 		}
 
 		return RE::BSEventNotifyControl::kContinue;
@@ -159,6 +158,63 @@ namespace FOVSlider
 			logger::info(
 				"[FOVSlider] Player animation event hook installed "
 				"(PlayerCharacter::VTABLE[3], vfunc 1)");
+		}
+
+		// ============================================================
+		// FirstPersonState::Update hook - same-frame FOV cut guard
+		// ============================================================
+		// First attempt hooked PlayerCamera::Update (TESCamera vfunc 03)
+		// and NEVER fired - the 15:39 session log shows the guard arming
+		// three times with zero disarm lines while the engine's 90->105
+		// ramp ran untouched, so the engine calls PlayerCamera::Update
+		// directly (devirtualized), not through the vtable.
+		//
+		// TESCameraState::Update CANNOT be devirtualized: TESCamera holds
+		// polymorphic state objects and dispatches currentState->Update
+		// through the state's vtable every frame. Update is slot 0x0B on
+		// the primary vtable (BSInputEventUser base occupies 00-08, then
+		// Begin=09, End=0A, Update=0B - see TESCameraState.h). Hooking
+		// FirstPersonState's vtable gives us a per-frame callback exactly
+		// while the first-person camera is active, which is precisely
+		// when the post-terminal cut needs same-frame correction: the
+		// engine's own FOV writes happen inside this state update, so
+		// correcting after the original returns lands before the renderer
+		// consumes worldFOV and the wrong value is never displayed.
+		using CameraStateUpdateFn = void (*)(
+			RE::TESCameraState*,
+			RE::BSTSmartPointer<RE::TESCameraState>&);
+
+		CameraStateUpdateFn g_originalFirstPersonStateUpdate = nullptr;
+		std::atomic_bool    g_firstPersonStateHookInstalled{ false };
+
+		void HookedFirstPersonStateUpdate(
+			RE::TESCameraState*                       a_this,
+			RE::BSTSmartPointer<RE::TESCameraState>&  a_nextState)
+		{
+			g_originalFirstPersonStateUpdate(a_this, a_nextState);
+			FOVManager::GetSingleton()->OnCameraUpdateFrame();
+		}
+
+		void InstallFirstPersonStateUpdateHook()
+		{
+			if (g_firstPersonStateHookInstalled.exchange(true)) {
+				return;
+			}
+
+			REL::Relocation<std::uintptr_t> firstPersonStateVtable{
+				RE::VTABLE::FirstPersonState[0]
+			};
+			g_originalFirstPersonStateUpdate = reinterpret_cast<CameraStateUpdateFn>(
+				firstPersonStateVtable.write_vfunc(11, &HookedFirstPersonStateUpdate));
+
+			if (!g_originalFirstPersonStateUpdate) {
+				g_firstPersonStateHookInstalled.store(false);
+				REX::FAIL("[FOVSlider] FirstPersonState::Update vtable hook returned a null original");
+			}
+
+			logger::info(
+				"[FOVSlider] FirstPersonState update hook installed "
+				"(FirstPersonState::VTABLE[0], vfunc 11)");
 		}
 	}
 
@@ -239,6 +295,14 @@ namespace FOVSlider
 
 			if (hadTerm && fov->GetContext() == FOVContext::Terminal) {
 				fov->OnTerminalExited();
+			} else {
+				// Non-terminal furniture (workbenches, chairs, power-armor
+				// stations) gets the same late first-person camera cut at
+				// the menu-override FOV. FP gunplay's resume-from-block
+				// lerp used to paper over it by hard-writing worldFOV;
+				// now that its EXECs are worldFOV-neutral, the guard owns
+				// this window for all furniture.
+				fov->SuppressCameraTransitionZoom("CameraOverrideEnd");
 			}
 			return;
 		}
@@ -251,6 +315,7 @@ namespace FOVSlider
 	{
 		MenuSink::GetSingleton()->Register();
 		InstallPlayerAnimationEventHook();
+		InstallFirstPersonStateUpdateHook();
 	}
 
 	void OnGameLoaded()

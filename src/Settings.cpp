@@ -114,6 +114,164 @@ namespace FOVSlider
 		return true;
 	}
 
+	// Surgically replace (or insert) `key=value` lines inside specific
+	// sections of a Bethesda INI, preserving every other line byte-for-byte.
+	// Used on Fallout4.ini, which we must not reformat: a CSimpleIni
+	// round-trip would rewrite the whole file and disturb tooling like
+	// BethINI. Returns true when the file was written (or already correct).
+	struct IniPatchEntry
+	{
+		const char* section;  // without brackets
+		const char* key;
+		float       value;
+	};
+
+	static bool PatchIniValuesInPlace(const std::filesystem::path& a_path,
+	                                  std::span<const IniPatchEntry> a_entries)
+	{
+		if (!std::filesystem::exists(a_path)) {
+			// Do not fabricate the game's master INI - if it isn't where we
+			// expect it, this is not the setup we think it is.
+			logger::warn("[FOVSlider] '{}' not found; FOV keys were not synced into it",
+				a_path.string());
+			return false;
+		}
+
+		std::ifstream in(a_path);
+		if (!in) {
+			logger::warn("[FOVSlider] Could not open '{}' for reading", a_path.string());
+			return false;
+		}
+		std::vector<std::string> lines;
+		bool crlf = false;
+		for (std::string line; std::getline(in, line);) {
+			// Normalize line endings on read; re-apply on write so the
+			// file keeps a single consistent EOL style throughout.
+			if (!line.empty() && line.back() == '\r') {
+				line.pop_back();
+				crlf = true;
+			}
+			lines.push_back(std::move(line));
+		}
+		in.close();
+
+		const auto iequals = [](std::string_view a, std::string_view b) {
+			return a.size() == b.size() &&
+			       std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
+				       return std::tolower(static_cast<unsigned char>(x)) ==
+				              std::tolower(static_cast<unsigned char>(y));
+			       });
+		};
+		const auto trim = [](std::string_view s) {
+			while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
+			while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) s.remove_suffix(1);
+			return s;
+		};
+		const auto formatValue = [](float v) {
+			// Bethesda INIs use plain decimal ("80.0", "70"); four decimals
+			// keeps full float precision without scientific notation.
+			std::string s = std::format("{:.4f}", v);
+			return s;
+		};
+
+		bool changed = false;
+		std::vector<bool> done(a_entries.size(), false);
+
+		// Pass 1: replace keys that already exist in their section.
+		std::string currentSection;
+		for (auto& line : lines) {
+			const auto t = trim(line);
+			if (!t.empty() && t.front() == '[' && t.back() == ']') {
+				currentSection = std::string(t.substr(1, t.size() - 2));
+				continue;
+			}
+			const auto eq = t.find('=');
+			if (eq == std::string_view::npos) continue;
+			const auto key = trim(t.substr(0, eq));
+			for (std::size_t i = 0; i < a_entries.size(); ++i) {
+				if (done[i]) continue;
+				if (!iequals(currentSection, a_entries[i].section)) continue;
+				if (!iequals(key, a_entries[i].key)) continue;
+				const std::string replacement =
+					std::string(a_entries[i].key) + "=" + formatValue(a_entries[i].value);
+				if (line != replacement) {
+					line    = replacement;
+					changed = true;
+				}
+				done[i] = true;
+			}
+		}
+
+		// Pass 2: insert missing keys right below their section header
+		// (append the section itself if the file lacks it entirely).
+		for (std::size_t i = 0; i < a_entries.size(); ++i) {
+			if (done[i]) continue;
+			const std::string wanted =
+				std::string(a_entries[i].key) + "=" + formatValue(a_entries[i].value);
+			bool inserted = false;
+			for (std::size_t li = 0; li < lines.size(); ++li) {
+				const auto t = trim(lines[li]);
+				if (!t.empty() && t.front() == '[' && t.back() == ']' &&
+				    iequals(t.substr(1, t.size() - 2), a_entries[i].section)) {
+					lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(li) + 1, wanted);
+					inserted = true;
+					break;
+				}
+			}
+			if (!inserted) {
+				lines.push_back(std::string("[") + a_entries[i].section + "]");
+				lines.push_back(wanted);
+			}
+			changed = true;
+		}
+
+		if (!changed) {
+			return true;  // already correct - no write, no timestamp churn
+		}
+
+		std::ofstream out(a_path, std::ios::trunc | std::ios::binary);
+		if (!out) {
+			logger::warn("[FOVSlider] Could not open '{}' for writing", a_path.string());
+			return false;
+		}
+		const char* eol = crlf ? "\r\n" : "\n";
+		for (const auto& line : lines) {
+			out << line << eol;
+		}
+		logger::info("[FOVSlider] Synced FOV keys into '{}'", a_path.string());
+		return true;
+	}
+
+	// The engine's post-load restore pass re-applies camera defaults from
+	// Fallout4.ini - NOT from Fallout4Custom.ini (verified 2026-08-01: with
+	// Custom.ini carrying 105, loads still restored fDefault1stPersonFOV=80,
+	// fDefaultWorldFOV=70, f3rdPersonAimFOV=50, exactly the Fallout4.ini
+	// values, ~0.5-2 s AFTER the load fade lifts - too late for any covered-
+	// window maintenance to hide). Writing our values into Fallout4.ini
+	// itself makes that restore a no-op. Under Mod Organizer 2 with profile-
+	// local INIs the Documents path is VFS-redirected into the profile's
+	// fallout4.ini, which is exactly the file the engine reads.
+	static bool SyncFallout4MainIniFile(Settings* self)
+	{
+		if (!self->syncFallout4CustomIni.load()) {
+			return true;
+		}
+
+		const auto customPath = Settings::ResolveFallout4CustomIniPath();
+		if (customPath.empty()) {
+			return false;
+		}
+		const auto mainPath = customPath.parent_path() / "Fallout4.ini";
+
+		const IniPatchEntry entries[] = {
+			{ "Display", "fDefault1stPersonFOV", self->firstPersonFOV.load() },
+			{ "Display", "fDefaultWorldFOV",     self->thirdPersonFOV.load() },
+			{ "Display", "fNearDistance",        self->cameraDistance.load() },
+			{ "Camera",  "f3rdPersonAimFOV",     self->thirdPersonAimFOV.load() },
+		};
+		return PatchIniValuesInPlace(mainPath, entries);
+	}
+
 	std::filesystem::path Settings::GetIniPath() const
 	{
 		const auto modulePath = GetThisModulePath();
@@ -313,6 +471,10 @@ namespace FOVSlider
 
 		if (pluginEnabled.load()) {
 			(void)SyncFallout4CustomIniFile(this);
+			// Fallout4.ini is the file the engine's post-load restore pass
+			// actually reads its camera defaults from; keeping it in sync
+			// is what prevents the post-fade FOV reset on game load.
+			(void)SyncFallout4MainIniFile(this);
 		}
 		return true;
 	}

@@ -472,18 +472,23 @@ namespace FOVSlider::Menu
 			Spacing();
 			Separator();
 
-			// ---- FPInertia ----
-			TextColored(ImVec4(0.6f, 0.85f, 1.0f, 1.0f), "FPInertia");
+			// ---- FP Gunplay Overhaul (formerly FPInertia) ----
+			TextColored(ImVec4(0.6f, 0.85f, 1.0f, 1.0f), "FP Gunplay Overhaul");
 			Spacing();
-			if (const auto* info = F4SE::GetPluginInfo("FPInertia")) {
-				Text("Detected: yes (api version %u)", info->version);
+			// Report from the name kPostPostLoad resolved so the panel and
+			// the actual dispatch target can never disagree.
+			const auto& fpName = FOVManager::GetSingleton()->fpPluginName;
+			if (!fpName.empty()) {
+				const auto* info = F4SE::GetPluginInfo(fpName.c_str());
+				Text("Detected: yes (%s, api version %u)",
+					fpName.c_str(), info ? info->version : 0u);
 				TextWrapped("Cross-plugin handshake is active. Pip-Boy / Terminal "
-				            "transitions lock FPInertia's WBFOV applies until our "
+				            "transitions lock its WBFOV applies until our "
 				            "lerp completes.");
 			} else {
 				Text("Detected: no");
 				TextWrapped("Viewmodel FOV is fully owned by this plugin. Per-weapon "
-				            "WBFOV overrides require FPInertia.");
+				            "WBFOV overrides require FP Gunplay Overhaul.");
 			}
 
 			Spacing();
